@@ -8,7 +8,7 @@
   "plan_committed": false,
   "builder": {
     "tool": "opencode",
-    "model": "",
+    "model": "cloudflare-workers-ai/@cf/zai-org/glm-5.3",
     "config": "",
     "thinking": false
   },
@@ -22,7 +22,8 @@
   "commands": {
     "install": "",
     "phase": "",
-    "mutate": ""
+    "mutate": "",
+    "sweep": ""
   },
   "stop_policy": {
     "failed_reviews": 6,

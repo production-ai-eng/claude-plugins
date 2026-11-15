@@ -19,9 +19,13 @@ It is cumulative: session N's run includes every earlier session's tests. It fai
 | Clean tree | There are uncommitted changes (with an explicit switch to allow it for the reviewer's own mutations). |
 | Opt-outs | A test used an escape hatch of the harness that the plan does not allow that test. |
 
-The summary file records: the session, the commit, each test id with its result and assertion count, the fixture hashes, the static results, the opt-outs, and the tool versions. Two runs at the same commit produce the same summary apart from times.
+The summary file records: the session, the commit, each test id with its result and assertion count, the fixture hashes, the static results, the opt-outs, the tool versions, and the time each layer took. Two runs at the same commit produce the same summary apart from times.
 
-The phase command also has a mode that prints the generated parts of the handback from the same run, and a mode that compares its summary with another one.
+**No test nests the whole phase command.** A test that checks the tool by running the full phase command inside itself makes every run pay for two: in a large rebuild one such test was most of the run's time. Test the tool on a small fixture world instead. Before blaming a layer for being slow, read the layer timings in the summary.
+
+**Expensive worlds are built once.** A test world that takes real requests to build (thousands of rows, say) is built once per run and shared by the tests that only read it.
+
+The phase command also has a mode that writes the generated parts of the handback from the same run (`handback-generated.md` beside the handback; a project set up before plugin 0.3.0 may print them instead), and a mode that compares its summary with another one.
 
 ## The static layer
 
@@ -34,6 +38,19 @@ Exemptions are where a static layer rots. Every exemption is listed in one place
 A mutation is a small patch that puts a defect back into the product. The mutation run applies each patch in a scratch copy, runs the named test, and expects it to fail. A mutation whose test still passes is a survivor, and a survivor fails the session.
 
 The plan lists the mutations per session, each chosen for a defect that matters: remove an authorisation check, drop a state transition's guard, return success without writing. The builder writes the patch files; the reviewer checks that each patch does what its header says and nothing else.
+
+- **A patch runs the one test file that must catch it**, not the whole layer, and the tool checks that this file passes before the patch is applied. The tool honours that line as written; replacing it by the phase command made each mutation cost two full runs.
+- **Every session runs every earlier mutation too** (the full run), because a later change can revive an old defect. That list only grows, so the full run is the conductor's, at the tip under review; the builder runs only the patches whose lines it moved or changed (a single-patch mode).
+- **The tool clears its own scratch state at start**: leftover processes and scratch copies of an interrupted run make every mutation report "baseline did not pass" within seconds. That message, that fast, means leftovers, not a failing test.
+
+## The line sweep
+
+The mutation list is what the plan's authors thought of. The line sweep is what they did not: a tool that removes each line of product code that makes a decision (a refusal, a guard, a write, a state change, a cleanup), one at a time, runs the tests, and reports each change as killed, survived or skipped. A survivor is a behaviour no test holds.
+
+- **Build it in the first build session**, with its own self-test, so that every later session is swept from the start. Added after several sessions, it meets all of their survivors at once.
+- It takes a commit to sweep from (only lines changed since then), so that a re-review sweeps only the new lines.
+- It sweeps numeric literals too, including those written with digit separators (`86_400`): a sweep that only knows plain digits never touches a limit written that way.
+- It is long (hours on a large session), so it is the conductor's to run, at the tip under review, never the builder's. The builder receives the survivors and, for each, kills it with a test or explains it with the smallest setup it tried. An explanation is a claim the reviewer tries to disprove.
 
 ## Tests before code
 
@@ -60,26 +77,20 @@ Stand-ins are checked against the real platform's recorded answers from a spike,
 4. One command. Report nothing from any other.
 5. Say what was not done. An unfinished item listed as not done is a normal outcome. An unfinished item reported as done fails the session.
 6. When the plan looks wrong, stop. Write what each place says and ask.
+7. Short commands only. Single test files while working; the phase command once, in the foreground, at the end. Never a background command polled with `sleep`: the turn ends while it waits. The full mutation run and the line sweep are the conductor's.
+8. A test fails at its own commit on its own assertion, not on a missing module, a missing checker or a syntax error. A self-test of a harness module or a tool is committed alone, before the change it tests.
 
 ## What the builder hands back
 
-`handback/<session>/handback.md`, with the summary files beside it. Test output is not pasted in: the reviewer runs the command and compares the files. The headings, in this order (the template is `templates/handback.md`):
+`handback/<session>/handback.md`: one page (the template is `templates/handback.md`). The parts a tool can produce are not typed: the phase command's handback mode writes them into `handback-generated.md` beside it (acceptance tests, requirement to tests, mutations killed and by which test, opt-outs), and the summary files sit beside both. Test output is not pasted in: the reviewer runs the command and compares the files.
 
-| # | Heading | Content |
-|---|---|---|
-| 0 | Identity | Branch, full commit id, the previous accepted tag, tool versions, hash of each summary file. |
-| 1 | Summary | What now works that did not. At most ten lines. No "verified" or count without a test id beside it. |
-| 2 | Phase command | The command, its exit code, the summary's path. |
-| 3 | Acceptance tests | Generated. By hand only: any test that could not be written as specified, what the plan says, what was done. Such a test is left failing, not skipped. |
-| 4 | Requirements | Generated: requirement to tests. Every requirement of the session with no test, and why. |
-| 5 | Mutations | Generated: id, killed or not, by which test. |
-| 6 | Opt-outs | Generated: every escape hatch used, with test and reason. |
-| 7 | Changes to earlier tests, fixtures or harness | Each with a reason. "None" if none. |
-| 8 | Spikes | Each note's path and each question's answer word. |
-| 9 | Deviations from the plan | Anything done differently, and why. Anything in the plan the builder believes is wrong. |
-| 10 | Not done | Everything unfinished. |
-| 11 | Needs the owner | Actions or answers only the owner can give, with exact commands. |
-| 12 | Files | Added, changed, deleted against the previous accepted tag. |
-| 13 | Least sure of | The five tests or behaviours the builder trusts least. |
+| Heading | Content |
+|---|---|
+| Tip | The full commit id. |
+| Results | The phase command's result line, copied from the tool. The `--patch` result of each patch changed or moved. |
+| What was built | Five lines at most, in terms of behaviour. For a spike, each note and its answer word. |
+| Deviations and rulings used | Each ruling relied on, by label; anything done differently, and why; changes to earlier tests, fixtures or harness, with reasons; anything not done; anything only the owner can do, with exact commands; for a findings round, each finding and its commits. |
+| Questions | `None.`, or `blocked` on the first line and each question with its two readings. |
+| Least sure of | What a reviewer should try first, and for each line called untestable, the smallest setup tried. |
 
-A builder that is blocked writes the handback anyway, with the word `blocked` under heading 10 and the question under heading 9, and ends its turn. That is how a builder that cannot ask mid-run asks.
+The builder writes the file first, with a line `UNFINISHED` at the top and its task list, updates it at each commit, and removes the line at the end. A turn that ends with the line still there is an unfinished turn, and the next turn starts from the list. A builder that is blocked writes `blocked` under Questions and ends its turn: that is how a builder that cannot ask mid-run asks. `factory.mjs check-handback` reads all three states, and still reads the fourteen-heading handback of earlier plugin versions.

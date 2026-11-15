@@ -15,6 +15,9 @@ One entry per session, in this shape.
   handback/<session>-PROMPT.md, worktree from <commit>. If you find this entry with no verdict under it,
   a conductor was part-way through: check the run's status before anything else.
 - **Verdict:** accepted. Merged (<commit>), tagged, pushed or not. Turns, recoveries, answered questions, failed reviews.
+  Elapsed from made-ready to accept, and the idle part of it.
+- Between those, a dated line whenever the state changes (built, a look failed, findings out, a run ended),
+  with the elapsed time so far. Past two hours, say what is taking the time and what is being changed.
 - **What exists now that did not:** in terms of behaviour, with one concrete example.
 - **What the review found:** how many breakages were tried and caught, and one example of what a survivor would have meant.
 - **Rulings I made that you may overturn:** each in one sentence, with an example.

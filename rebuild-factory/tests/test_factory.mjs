@@ -251,6 +251,85 @@ fac(repo, 'trust', '--yes');
 r = fac(repo, 'check-handback', '1b');
 ok('L4 the empty template is not accepted as a handback', r.code === 1 && J(r).headings_ok === true && J(r).identity_filled === false, r.out);
 
+// 0.3.0: the one-page handback, its UNFINISHED line and its Questions; the old fourteen headings still read
+const hbFile = path.join(plan, 'handback', '1b', 'handback.md');
+const onePage = (top, questions) => `${top}# Handback: session 1b\n\n## Tip\n\n${'a'.repeat(40)}\n\n## Results\n\n12 pass\n\n## What was built\n\nx\n\n## Deviations and rulings used\n\nNone.\n\n## Questions\n\n${questions}\n\n## Least sure of\n\ny\n`;
+fs.writeFileSync(hbFile, onePage('', 'None.'));
+r = fac(repo, 'check-handback', '1b');
+ok('a filled one-page handback is accepted', r.code === 0 && J(r).format === 'one page' && !J(r).blocked && !J(r).unfinished, r.out);
+fs.writeFileSync(hbFile, onePage('UNFINISHED: tasks 3 to 5\n\n', 'None.'));
+r = fac(repo, 'check-handback', '1b');
+ok('a handback that still says UNFINISHED is not a handback', r.code === 1 && J(r).unfinished === true && /UNFINISHED/.test(J(r).note), r.out);
+ok('where reports the session as unfinished', /^unfinished/.test(J(fac(repo, 'where')).next.stage));
+fs.writeFileSync(hbFile, onePage('', 'blocked\n\n1. Which limit wins? Reading A: ...; reading B: ...'));
+r = fac(repo, 'check-handback', '1b');
+ok('blocked under Questions is a question for the conductor', J(r).blocked === true && /^blocked/.test(J(fac(repo, 'where')).next.stage), r.out);
+fs.writeFileSync(hbFile, onePage('UNFINISHED: tasks 3 to 5\n\n', 'blocked\n\n1. Which limit wins?'));
+r = fac(repo, 'check-handback', '1b');
+ok('a blocked builder that keeps its UNFINISHED line is asking, not unfinished', r.code === 0 && J(r).blocked === true && /^blocked/.test(J(fac(repo, 'where')).next.stage), r.out);
+fs.writeFileSync(hbFile, onePage('', 'None.').replace('# Handback: session 1b\n', '# Handback: session 1b\n\nUNFINISHED: task 4\n'));
+r = fac(repo, 'check-handback', '1b');
+ok('UNFINISHED written under the title is seen too', r.code === 1 && J(r).unfinished === true, r.out);
+fs.writeFileSync(hbFile, onePage('', 'None.'));
+fs.writeFileSync(path.join(plan, 'handback', '1b', 'review-1.md'), '# Review 1\n');
+ok('a look\'s review file shows in where before any REVIEW.md exists', /review-1\.md/.test(J(fac(repo, 'where')).next.stage));
+fs.rmSync(path.join(plan, 'handback', '1b', 'review-1.md'));
+const oldHeads = ['Identity', 'Summary', 'Phase command', 'Acceptance tests', 'Requirements', 'Mutations', 'Opt-outs', 'Changes to earlier tests, fixtures or harness', 'Spikes', 'Deviations from the plan', 'Not done', 'Needs the owner', 'Files', 'Least sure of'];
+fs.writeFileSync(hbFile, '# Handback\n\n' + oldHeads.map((h, n) => `## ${n}. ${h}\n\n${n === 0 ? 'Commit: ' + 'b'.repeat(40) : n === 10 ? 'blocked' : 'x'}\n`).join('\n'));
+r = fac(repo, 'check-handback', '1b');
+ok('the old fourteen-heading handback is still read, blocked under Not done', J(r).headings_ok === true && J(r).format.startsWith('old') && J(r).blocked === true, r.out);
+fs.writeFileSync(hbFile, onePage('', 'None.').replace('## Questions', '## Asks'));
+r = fac(repo, 'check-handback', '1b');
+ok('a one-page handback missing a heading is refused and names it', r.code === 1 && J(r).missing.includes('Questions'), r.out);
+
+// 0.3.0: findings rounds get their own prompt, in a fresh run in the session's own worktree
+const fcfg = JSON.parse(fs.readFileSync(path.join(plan, 'factory.config.json'), 'utf8'));
+const wt1b = path.join(fcfg.worktree_root, '1b');
+fs.writeFileSync(path.join(T, 'findings.txt'), '1. F1: hold the cap. Plant P01 must fail AT-9. Quote {{TIP}} kept as written.');
+r = fac(repo, 'findings', '1b', '--round', '2', '--findings-file', path.join(T, 'findings.txt'));
+ok('findings refuses a session with no worktree', r.code === 2 && /no worktree/.test(r.out), r.out);
+git(repo, 'worktree', 'add', '-q', wt1b, '-b', 'factory/1b', 'main');
+r = fac(repo, 'findings', '1b', '--round', '2', '--findings-file', path.join(T, 'findings.txt')); const fr = J(r);
+const fText = r.code === 0 ? fs.readFileSync(fr.prompt_file, 'utf8') : '';
+ok('findings fills the prompt: tip, round, review file and the job list as written', r.code === 0 && fText.includes(git(wt1b, 'rev-parse', 'HEAD')) && fText.includes('review-2.md') && fText.includes('Plant P01 must fail AT-9') && fText.includes('Quote {{TIP}} kept as written') && !/\{\{[A-Z_]+\}\}/.test(fText.replace('Quote {{TIP}} kept as written', '')), r.out);
+ok('findings names a fresh run for the round and the steps to start it', /^app-[0-9a-f]{6}-1b-r2$/.test(fr.run_id) && fr.next.some((s) => s.includes('seal 1b')) && fr.next.some((s) => s.includes(`id=${fr.run_id}`) && s.includes('builder-rules.json')), JSON.stringify(fr));
+fs.writeFileSync(path.join(wt1b, 'a.txt'), 'a plant left behind');
+r = fac(repo, 'findings', '1b', '--round', '3', '--findings-file', path.join(T, 'findings.txt'));
+ok('findings refuses a worktree that is not clean', r.code === 2 && /not clean/.test(r.out) && !fs.existsSync(path.join(plan, 'handback', '1b-FINDINGS-3.md')), r.out);
+git(wt1b, 'checkout', '--', '.');
+r = fac(repo, 'findings', '1a', '--round', '2', '--findings-file', path.join(T, 'findings.txt'));
+ok('findings refuses a session already accepted', r.code === 2 && /already accepted/.test(r.out), r.out);
+fac(repo, 'remove', 'builder_must_not_read', 'factory-plan/audit/');
+r = fac(repo, 'findings', '1b', '--round', '5', '--findings-file', path.join(T, 'findings.txt'));
+ok('findings, like prompt, refuses to fill without the must-not-read list', r.code === 2 && /MUST_NOT_READ/.test(r.out) && !fs.existsSync(path.join(plan, 'handback', '1b-FINDINGS-5.md')), r.out);
+fac(repo, 'add', 'builder_must_not_read', 'factory-plan/audit/');
+ok('the findings prompt carries the must-not-read list', fText.includes('`factory-plan/audit/`'));
+ok('the findings prompt carries the safety lines', /overrides this prompt/.test(fText) && /opencode\.json/.test(fText) && /another spelling/.test(fText) && /secret/.test(fText) && /later session/.test(fText) && /Do not end your turn/.test(fText));
+for (const bad of ['0', '100', 'x', '']) {
+  r = fac(repo, 'findings', '1b', '--round', bad, '--findings-file', path.join(T, 'findings.txt'));
+  ok(`findings refuses round "${bad}"`, r.code === 2 && /--round/.test(r.out), r.out);
+}
+fs.writeFileSync(path.join(T, 'garbled.txt'), 'Read the fixture\x0cile first');
+r = fac(repo, 'findings', '1b', '--round', '4', '--findings-file', path.join(T, 'garbled.txt'));
+ok('findings refuses a prompt that holds a control character', r.code === 2 && /control character/.test(r.out) && !fs.existsSync(path.join(plan, 'handback', '1b-FINDINGS-4.md')), r.out);
+r = fac(repo, 'prompt', '1b', '--notes-file', path.join(T, 'garbled.txt'));
+ok('prompt refuses notes that hold a control character', r.code === 2 && /control character/.test(r.out), r.out);
+// where follows the latest findings round's run
+for (const n of ['r2', 'r10', 'rx']) {
+  fs.mkdirSync(path.join(HOME, 'runs', `${fr.run_id.replace(/-r2$/, '')}-${n}`), { recursive: true });
+  fs.writeFileSync(path.join(HOME, 'runs', `${fr.run_id.replace(/-r2$/, '')}-${n}`, 'state.json'), JSON.stringify({ status: 'finished', turn: n === 'r10' ? 7 : 1 }));
+}
+fs.rmSync(hbFile);
+w = J(fac(repo, 'where'));
+ok('where reports the latest findings round\'s run', w.next.run.run.endsWith('-1b-r10') && w.next.run.turn === 7, JSON.stringify(w.next.run));
+git(repo, 'worktree', 'remove', '--force', wt1b);
+git(repo, 'branch', '-D', 'factory/1b');
+fac(repo, 'seal', '1b');
+// init writes the default builder
+const fresh = mkrepo('fresh');
+fac(fresh, 'init');
+ok('init sets the default builder model', JSON.parse(fs.readFileSync(path.join(fresh, 'factory-plan', 'factory.config.json'), 'utf8')).builder.model === 'cloudflare-workers-ai/@cf/zai-org/glm-5.3');
+
 // H3: a plan folder that arrives with the repository
 const hostile = mkrepo('cloned');
 const hp = path.join(hostile, 'factory-plan');
@@ -355,6 +434,9 @@ const savedPhases = fs.readFileSync(path.join(plan, 'plan', 'phases.json'), 'utf
 fs.writeFileSync(path.join(plan, 'plan', 'phases.json'), JSON.stringify([{ id: 'baseline' }]));
 r = fac(repo, 'where');
 ok('N3 "baseline" cannot be a session id', r.code === 2 && /cannot be a session id/.test(r.out), r.out);
+fs.writeFileSync(path.join(plan, 'plan', 'phases.json'), JSON.stringify([{ id: '1b-r2' }]));
+r = fac(repo, 'where');
+ok('a session id cannot end like a findings round\'s run', r.code === 2 && /findings round/.test(r.out), r.out);
 fs.writeFileSync(path.join(plan, 'plan', 'phases.json'), savedPhases);
 
 // the shipped rules: what they refuse and what they leave alone

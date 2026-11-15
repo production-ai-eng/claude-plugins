@@ -32,7 +32,7 @@ Run `show` and present the settings grouped, in words, not as JSON:
 - **Stop limits**: failed reviews, unfinished turns, stalls, and whether accepted work is pushed.
 - **No agent may**: the owner-only list.
 - **Machine**: how many helpers at once; where worktrees go.
-- **Commands**: install, phase, mutate.
+- **Commands**: install, phase, mutate, sweep.
 
 Say what is still empty and at which stage each is needed.
 
@@ -43,6 +43,7 @@ Translate what they said into the key, make the change, and confirm in one line 
 | The owner says | Do |
 |---|---|
 | "build with <model>" | `set builder.model <id>`. If unsure of the id, run `opencode models` and match it. |
+| "the sweep is `<the plan's sweep command>`" | `set commands.sweep <command>`, with `{session}` and `{since}` where the tool takes them |
 | "use opus for the plan reviewers", "cheap model for the session review" | `set models.<agent> <name>` |
 | "reviewers on whatever this chat uses" | `unset models.<agent>` |
 | "allow eight failed reviews" | `set stop_policy.failed_reviews 8` |
@@ -57,6 +58,12 @@ Two changes need a word of caution before you make them:
 - **`builder.config`** names the rules file: the commands the builder is refused while it runs auto-approved. It cannot be emptied or unset. If the owner points it at another file, read that file, say what it refuses, and run `factory.mjs doctor` to see which sample commands get through. The project's own copy is `factory-plan/builder-rules.json`; edit that one, never the copy inside the plugin. Editing it outside the script breaks the folder's acceptance, which `trust --yes` restores once the owner has seen the change.
 
 A stop limit may be raised freely; it does not lower what counts as passing. If the conductor is running in another chat, tell the owner the change is read at the next session's start, and offer to note it at the top of `handback/PROGRESS.md` so the running conductor sees it.
+
+## The builder's model
+
+The default is `cloudflare-workers-ai/@cf/zai-org/glm-5.3` (GLM 5.3 on Cloudflare Workers AI): it is the builder a large rebuild settled on, for its cost, once the long runs moved to the conductor and the handback shrank to one page. It needs OpenCode signed in to Cloudflare Workers AI; `factory.mjs doctor` fails if OpenCode does not offer it.
+
+An Anthropic Sonnet through OpenCode is the fallback, not the default: when the owner cannot use the default provider, or decides that a session keeps failing on the builder's work rather than on the plan. Changing it is the owner's call; say what it costs. A change applies from the next run started.
 
 ## Helper models
 
@@ -76,10 +83,10 @@ The value is a model name the Agent tool accepts in this environment (for exampl
 
 When called during set-up, ask for these one at a time, each with a recommendation, and set each as it is answered:
 
-1. The builder's model. Have the owner run the check in the user guide if OpenCode has not been used on this machine.
+1. The builder's model. Recommend the default (above), and have the owner run the check in the user guide if OpenCode has not been used on this machine or with that provider.
 2. What no agent may do: read out the default list; ask what to add.
 3. The stop limits: the defaults are six failed reviews and six unfinished turns; ask when the owner expects to look in.
-4. Whether to push after each accepted session.
+4. Whether to push after each accepted session. Recommend yes when the remote is the owner's own: the conductor pushes only the main branch and the tag of a session it accepted, and cleans up after it, so the owner does not have to come back for each one. It never pushes a session branch.
 5. The helper models, offered as one choice: "strong for the audit and plan review, mid for session reviews" or "everything on this chat's model".
 
-Leave `commands.phase` and `commands.mutate` empty: the plan stage sets them.
+Leave `commands.phase`, `commands.mutate` and `commands.sweep` empty: the plan stage sets them.

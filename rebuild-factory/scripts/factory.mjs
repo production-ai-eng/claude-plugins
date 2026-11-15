@@ -6,6 +6,7 @@
 //   node factory.mjs trust [--yes]                 show what a plan folder will make agents run; --yes accepts it
 //   node factory.mjs where
 //   node factory.mjs prompt <session> --notes-file <file>
+//   node factory.mjs findings <session> --round <n> --findings-file <file>   the prompt for a builder answering review n
 //   node factory.mjs check-handback <session>
 //   node factory.mjs accept <session>              record a session as accepted, after its review, merge and tag
 //   node factory.mjs seal <session>                record the plan folder's contents before a builder turn
@@ -35,11 +36,22 @@ const PLAN_NAME = 'factory-plan';
 const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/;
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
 const REF_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+// The one-page handback (templates/handback.md). The generated parts (acceptance tests, requirements,
+// mutations, opt-outs) are the phase command's to write, in a file beside it.
 const HANDBACK_HEADINGS = [
+  'Tip', 'Results', 'What was built', 'Deviations and rulings used', 'Questions', 'Least sure of',
+];
+// The fourteen headings of plugin versions before 0.3.0, still read so that a project mid-rebuild,
+// or with its own kickoff prompt asking for them, keeps working.
+const OLD_HANDBACK_HEADINGS = [
   'Identity', 'Summary', 'Phase command', 'Acceptance tests', 'Requirements', 'Mutations', 'Opt-outs',
   'Changes to earlier tests, fixtures or harness', 'Spikes', 'Deviations from the plan', 'Not done',
   'Needs the owner', 'Files', 'Least sure of',
 ];
+// Control characters other than tab, newline and carriage return: a prompt that holds one was broken
+// on its way (a Windows path through an escaping step turns \f, \r or \1 into one).
+const DEFAULT_BUILDER = 'cloudflare-workers-ai/@cf/zai-org/glm-5.3';
+const CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 // Commands a rules file should refuse. doctor tries each against the file's deny patterns.
 const RULE_SAMPLES = [
   'git push origin main', 'git -C . push', 'git push --force', 'cd app && git push', 'git tag -m accepted accepted/1a main',
@@ -180,6 +192,7 @@ function load(o, { needTrust = true } = {}) {
       if (!s || !SESSION_RE.test(s.id || '')) fail(`plan/phases.json: bad session id ${JSON.stringify(s && s.id)}`);
       if (seen.has(s.id)) fail(`plan/phases.json: session ${s.id} is listed twice`);
       if (s.id === 'baseline') fail('plan/phases.json: "baseline" is the name of the starting tag and cannot be a session id');
+      if (/-r\d+$/.test(s.id)) fail(`plan/phases.json: session id ${s.id} ends like a findings round's run (-r<n>); rename it`);
       seen.add(s.id);
     }
   }
@@ -266,7 +279,15 @@ function runId(cfg, id) {
 
 function bridgeRun(cfg, id) {
   const home = process.env.OC_BRIDGE_HOME || path.join(os.homedir(), '.oc-bridge');
-  const run = runId(cfg, id);
+  // The run of the session's latest findings round (<run>-r<n>) if there is one, otherwise the session's run.
+  // Session ids may not end in -r<n> (load refuses them), so no session's run is mistaken for a round.
+  let run = runId(cfg, id);
+  try {
+    const rounds = fs.readdirSync(path.join(home, 'runs'))
+      .map((d) => d.startsWith(run + '-r') && /^\d+$/.test(d.slice(run.length + 2)) ? Number(d.slice(run.length + 2)) : 0)
+      .filter((n) => n > 0);
+    if (rounds.length) run = `${run}-r${Math.max(...rounds)}`;
+  } catch { /* no runs yet */ }
   try {
     const s = JSON.parse(fs.readFileSync(path.join(home, 'runs', run, 'state.json'), 'utf8'));
     return { run, recorded_status: s.status, turn: s.turn };
@@ -278,14 +299,22 @@ function handbackState(plan, id) {
   if (!fs.existsSync(f)) return { present: false };
   const text = fs.readFileSync(f, 'utf8');
   const lines = text.split(/\r?\n/);
-  let at = -1;
-  const missing = [];
-  const where = {};
-  HANDBACK_HEADINGS.forEach((h, n) => {
-    const re = new RegExp(`^#{1,4}\\s*${n}[.):]?\\s+${h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
-    const i = lines.findIndex((l, k) => k > at && re.test(l.trim()));
-    if (i < 0) missing.push(`${n}. ${h}`); else { at = i; where[n] = i; }
-  });
+  // Headings in order, each optionally numbered ("## Tip", "## 1. Tip"; the old form is "## 0. Identity").
+  const match = (heads) => {
+    let at = -1;
+    const missing = [];
+    const where = {};
+    heads.forEach((h, n) => {
+      const re = new RegExp(`^#{1,4}\\s*(?:\\d+[.):]?\\s+)?${h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i');
+      const i = lines.findIndex((l, k) => k > at && re.test(l.trim()));
+      if (i < 0) missing.push(h); else { at = i; where[n] = i; }
+    });
+    return { missing, where };
+  };
+  const one = match(HANDBACK_HEADINGS);
+  const old = one.missing.length ? match(OLD_HANDBACK_HEADINGS) : null;
+  const useOld = !!old && old.missing.length === 0;
+  const { missing, where } = useOld ? old : one;
   const section = (n) => {
     if (!(n in where)) return [];
     const out = [];
@@ -293,10 +322,26 @@ function handbackState(plan, id) {
     return out;
   };
   const firstOf = (n) => section(n).find((l) => l.trim()) || '';
-  const blocked = /^[*_`\s-]*blocked\b/i.test(firstOf(10));
-  // A handback that is the untouched template names no commit.
+  // A question for the conductor: `blocked` first under Questions (under "Not done" in the old form).
+  const blocked = /^[*_`\s-]*blocked\b/i.test(firstOf(useOld ? 10 : 4));
+  // The builder's first act is a line UNFINISHED at the top (above or just under the title), removed at the
+  // end: still there means the turn ended before the work did. Looked for anywhere before the first heading
+  // after the title.
+  const firstHead = where[0];
+  const top = lines.slice(0, firstHead === undefined ? lines.length : firstHead);
+  const unfinished = top.some((l) => /^[*_`\s-]*unfinished\b/i.test(l));
+  // A handback that is the untouched template names no commit (under Tip; Identity in the old form).
   const identityFilled = /\b[0-9a-f]{7,40}\b/.test(section(0).join('\n'));
-  return { present: true, file: f, headings_ok: missing.length === 0, missing, identity_filled: identityFilled, blocked };
+  return { present: true, file: f, format: useOld ? 'old (14 headings)' : 'one page', headings_ok: missing.length === 0,
+    missing, identity_filled: identityFilled, blocked, unfinished };
+}
+
+function reviewFiles(plan, id) {
+  try {
+    return fs.readdirSync(path.join(plan, 'handback', id))
+      .filter((f) => f === 'REVIEW.md' || /^review-\d+\.md$/.test(f))
+      .sort((x, y) => (Number(x.match(/\d+/)?.[0] || 1e9)) - (Number(y.match(/\d+/)?.[0] || 1e9)));
+  } catch { return []; }
 }
 
 function sessionState({ plan, cfg }, s, tagSet) {
@@ -310,11 +355,13 @@ function sessionState({ plan, cfg }, s, tagSet) {
     worktree: fs.existsSync(wt) ? wt : null,
     run: bridgeRun(cfg, s.id),
     handback: hb,
-    review: fs.existsSync(path.join(plan, 'handback', s.id, 'REVIEW.md')),
+    // The final record (REVIEW.md) or any look's report (review-<n>.md).
+    review: reviewFiles(plan, s.id),
   };
   st.stage = st.accepted ? 'accepted'
-    : st.review && hb.present ? 'a review file exists and the session is not accepted: findings are with the builder, the builder has handed back again, or the merge is pending. Read the review and the run status.'
+    : st.review.length && hb.present ? `a review file exists (${st.review.join(', ')}) and the session is not accepted: findings are with the builder or not yet sent, the builder has handed back again, or the merge is pending. Read the latest review and the run status.`
     : hb.present && hb.blocked ? 'blocked: the builder has a question'
+    : hb.present && hb.unfinished ? 'unfinished: the handback still says UNFINISHED. Check the run status; a turn that ended so counts as unfinished'
     : hb.present ? 'handed back: review it'
     : st.run.recorded_status ? `run ${st.run.recorded_status} (turn ${st.run.turn}): check its status`
     : st.worktree && st.prompt ? 'ready to start the builder'
@@ -384,6 +431,7 @@ function cmdPrompt(o) {
   if (s.kind === 'spike') { const i = empty.indexOf('MUTATE_COMMAND'); if (i >= 0) empty.splice(i, 1); }
   if (empty.length) fail(`cannot fill the prompt; no value for: ${empty.join(', ')}. Set them with factory.mjs set (commands.*), add (owner_only, builder_must_not_read), or write prompts/PROJECT.md.`);
   t = t.replace(/\{\{([A-Z_]+)\}\}/g, (m, k) => values[k]);
+  if (CONTROL_RE.test(t)) fail('the filled prompt holds a control character (the notes file, or a value from the settings, was garbled on its way: a path through an escaping step does that). Write the notes with a file-writing tool, not through a shell or a script, and try again.');
   const out = path.join(plan, 'handback', `${id}-PROMPT.md`);
   fs.mkdirSync(path.dirname(out), { recursive: true });
   fs.writeFileSync(out, t);
@@ -400,14 +448,72 @@ function cmdPrompt(o) {
   };
 }
 
+// ---- findings: the prompt for a builder answering review N, started as a fresh run in the same worktree.
+// A fresh run per round keeps the builder's conversation short: a long one ends turns early and empty.
+function cmdFindings(o) {
+  const { plan, cfg, sessions } = load(o);
+  const id = o._[0];
+  if (!sessions.find((x) => x.id === id)) fail(`session "${id}" is not in plan/phases.json`);
+  if (tags(cfg, plan).ok.has(cfg.tag_prefix + id)) fail(`session ${id} is already accepted: findings go to the next session's block, as carried items`);
+  const rules = rulesFileOf(cfg);
+  const round = Number(o.round);
+  if (!/^\d{1,2}$/.test(String(o.round || '')) || round < 1) fail('pass --round <n>: the number of the review whose findings these are, 1 to 99');
+  if (!o.findingsFile) fail('pass --findings-file: your rulings on the review, written as the builder\'s job list');
+  const fpath = path.resolve(o.findingsFile);
+  if (!fs.existsSync(fpath)) fail(`findings file not found: ${fpath}`);
+  const findings = fs.readFileSync(fpath, 'utf8').trim() || fail('the findings file is empty');
+  const wt = path.join(cfg.worktree_root, id);
+  const branch = cfg.branch_prefix + id;
+  if (!fs.existsSync(wt)) fail(`no worktree for ${id} at ${wt}: a findings round continues the session's own worktree`);
+  let tip, onBranch, dirty;
+  try {
+    tip = git(wt, ['rev-parse', 'HEAD']);
+    onBranch = git(wt, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    dirty = git(wt, ['status', '--porcelain']);
+  } catch (e) { fail(`cannot read the worktree ${wt}: ${String(e.stderr || e.message).trim()}`); }
+  if (onBranch !== branch) fail(`the worktree is on ${onBranch}, not ${branch}`);
+  if (dirty) fail(`the worktree is not clean (a plant of the review left in it?):\n${dirty}\nRestore it before the builder starts.`);
+  if (!cfg.commands?.phase) fail('commands.phase is not set');
+  const cmd = (c) => (c || '').replaceAll('{session}', id);
+  const values = {
+    SESSION: id, PROJECT: cfg.project, ROUND: String(round), WORKTREE: wt, BRANCH: branch, TIP: tip, PLAN_DIR: plan,
+    PHASE_COMMAND: cmd(cfg.commands.phase), OWNER_ONLY: (cfg.owner_only || []).join('; '),
+    MUST_NOT_READ: (cfg.builder_must_not_read || []).map((p) => '`' + p + '`').join(', '), FINDINGS: findings,
+  };
+  // As for the session prompt: a fresh conversation carries only what this prompt tells it.
+  const empty = ['OWNER_ONLY', 'MUST_NOT_READ'].filter((k) => !values[k]);
+  if (empty.length) fail(`cannot fill the prompt; no value for: ${empty.join(', ')}. Set them with factory.mjs add (owner_only, builder_must_not_read).`);
+  let t = fs.readFileSync(path.join(ROOT, 'templates', 'findings-prompt.md'), 'utf8');
+  t = t.replace(/\{\{([A-Z_]+)\}\}/g, (m, k) => (k in values ? values[k] : fail(`the findings template has a token this tool does not know: ${m}`)));
+  if (CONTROL_RE.test(t)) fail('the filled prompt holds a control character (the findings file was garbled on its way: a path through an escaping step does that). Write it with a file-writing tool, not through a shell or a script, and try again.');
+  const run = `${runId(cfg, id)}-r${round}`;
+  if (run.length > 64) fail(`the run id ${run} is longer than the bridge takes (64): shorten the project name with factory.mjs set project`);
+  const out = path.join(plan, 'handback', `${id}-FINDINGS-${round}.md`);
+  const replaced = fs.existsSync(out);
+  fs.writeFileSync(out, t);
+  const review = path.join(plan, 'handback', id, `review-${round}.md`);
+  return {
+    prompt_file: out, replaced, session: id, round, tip, worktree: wt, run_id: run,
+    review_file: fs.existsSync(review) ? review : `${review} (not found: the prompt sends the builder there; write the review there or edit the findings)`,
+    next: [
+      `factory.mjs seal ${id}`,
+      `opencode_start id=${run} dir="${wt}" prompt_file="${out}" model="${cfg.builder?.model || ''}" config="${rules}"`,
+    ],
+  };
+}
+
 function cmdCheckHandback(o) {
   const { plan, sessions } = load(o);
   const id = o._[0];
   if (!sessions.find((x) => x.id === id)) fail(`session "${id}" is not in plan/phases.json`);
   const hb = handbackState(plan, id);
   if (!hb.present) return { ok: false, session: id, present: false, note: 'no handback.md: the turn ended unfinished, or the builder wrote it somewhere else' };
-  const out = { ok: hb.headings_ok && hb.identity_filled, session: id, ...hb };
-  if (hb.headings_ok && !hb.identity_filled) out.note = 'the headings are there but Identity names no commit: this looks like the empty template';
+  // A blocked builder keeps its UNFINISHED line (the work is not done) and asks: that is a question, not an
+  // unfinished turn, and it never counts against the stop limits.
+  const out = { ok: hb.headings_ok && hb.identity_filled && (!hb.unfinished || hb.blocked), session: id, ...hb };
+  if (hb.blocked) out.note = 'blocked: the builder asks a question under Questions. Answer it from the plan; an answered question does not count';
+  else if (hb.unfinished) out.note = 'the first line still says UNFINISHED: the turn ended before the work did. Read the run status and the worktree; if the run is over, it counts as an unfinished turn';
+  else if (hb.headings_ok && !hb.identity_filled) out.note = 'the headings are there but Tip names no commit: this looks like the empty template';
   return out;
 }
 
@@ -503,7 +609,7 @@ function cmdInit(o) {
   writeTrust(plan, cfg);
   return {
     plan, config: cfgPath, project: cfg.project, kept_out_of_git: excluded, builder_rules: rules,
-    set_next: ['builder.model', 'commands.install', 'commands.phase and commands.mutate (once the plan names them; use {session})', 'builder_must_not_read', 'review owner_only, stop_policy and builder-rules.json with the owner', `tag the starting commit: git tag ${cfg.tag_prefix}baseline`],
+    set_next: [`builder.model (the default is ${DEFAULT_BUILDER}; doctor checks OpenCode offers it)`, 'commands.install', 'commands.phase, commands.mutate and commands.sweep (once the plan names them; use {session}, and {since} in the sweep)', 'builder_must_not_read', 'review owner_only, stop_policy and builder-rules.json with the owner', `tag the starting commit: git tag ${cfg.tag_prefix}baseline`],
   };
 }
 
@@ -604,7 +710,8 @@ const SETTINGS = {
   'builder.thinking': ['boolean', 'Write the builder\'s reasoning to its log as well as its actions.'],
   'commands.install': ['string', 'What a clean clone needs before anything runs.'],
   'commands.phase': ['string', 'The one command that decides a session; {session} is replaced.'],
-  'commands.mutate': ['string', 'The mutation run; {session} is replaced.'],
+  'commands.mutate': ['string', 'The full mutation run (every patch of this session and the earlier ones); {session} is replaced. The conductor runs it at the tip under review; the builder does not.'],
+  'commands.sweep': ['string', 'The line sweep: remove each decision line of the product, one at a time, and run the tests. {session} is replaced, and {since} by the commit after which lines count (the previous accepted tag, or the tip of the last look). Run by the conductor; the plan builds the tool in its first build session.'],
   'stop_policy.failed_reviews': ['count', 'Failed reviews of one session before the loop waits for the owner.'],
   'stop_policy.unfinished_turns': ['count', 'Builder turns ending with no handback before the loop waits.'],
   'stop_policy.stalls': ['count', 'Stalled waits before the loop waits for the owner.'],
@@ -619,7 +726,7 @@ const SETTINGS = {
   owner_only: ['list', 'Actions no agent takes.'],
   builder_must_not_read: ['list', 'Paths the builder is told not to open.'],
 };
-const CLEARABLE = new Set(['builder.model', 'commands.install', 'commands.phase', 'commands.mutate']);
+const CLEARABLE = new Set(['builder.model', 'commands.install', 'commands.phase', 'commands.mutate', 'commands.sweep']);
 
 function getPath(obj, key) { return key.split('.').reduce((a, k) => (a == null ? undefined : a[k]), obj); }
 function setPath(obj, key, v) {
@@ -816,7 +923,7 @@ function cmdDoctor(o) {
 
       const model = cfg.builder?.model;
       if (!model) add('builder model', build ? 'fail' : 'warn', 'not set', 'set builder.model <id>, an id from: opencode models');
-      else if (models && !models.includes(model)) add('builder model', 'fail', model + ' is not in the list opencode offers', 'pick an id from: opencode models');
+      else if (models && !models.includes(model)) add('builder model', build ? 'fail' : 'warn', model + ' is not in the list opencode offers', model === DEFAULT_BUILDER ? 'the default builder runs on Cloudflare Workers AI: sign OpenCode in to it (opencode auth login), or ask the owner for another model (an Anthropic Sonnet is the usual fallback) and set builder.model to an id from: opencode models' : 'pick an id from: opencode models');
       else add('builder model', models ? 'ok' : 'warn', model + (models ? '' : ' (could not verify)'));
 
       const rules = cfg.builder?.config;
@@ -837,6 +944,8 @@ function cmdDoctor(o) {
       add('worktree folder', wt.length <= 60 ? 'ok' : 'warn', wt + ' (' + wt.length + ' characters)', 'use a shorter path: deep paths break tools on Windows');
       if (!cfg.commands?.phase) add('commands.phase', build ? 'fail' : 'warn', 'not set', 'the plan stage sets it; the build stage cannot run without it');
       if (!cfg.commands?.install) add('commands.install', 'warn', 'not set', 'set it if a clean clone needs an install step');
+      if (!cfg.commands?.mutate) add('commands.mutate', 'warn', 'not set', 'the plan stage sets it; the conductor runs the full mutation run at each tip');
+      if (!cfg.commands?.sweep) add('commands.sweep', 'warn', 'not set', 'the plan builds a line-sweep tool in its first build session; set the command once it exists, so the conductor runs it at each tip');
     }
   }
 
@@ -850,7 +959,8 @@ function cmdDoctor(o) {
 }
 
 const cmds = {
-  init: cmdInit, doctor: cmdDoctor, trust: cmdTrust, where: cmdWhere, prompt: cmdPrompt, 'check-handback': cmdCheckHandback,
+  init: cmdInit, doctor: cmdDoctor, trust: cmdTrust, where: cmdWhere, prompt: cmdPrompt, findings: cmdFindings,
+  'check-handback': cmdCheckHandback,
   accept: cmdAccept, seal: cmdSeal, 'check-seal': cmdCheckSeal, show: cmdShow, set: cmdSet, unset: cmdUnset,
   add: (o) => cmdList(o, true), remove: (o) => cmdList(o, false),
 };
@@ -863,7 +973,7 @@ try {
   if (argv[0] === '--plan') { planOpt = argv[1]; argv.splice(0, 2); }
   const [name, ...rest] = argv;
   if (!cmds[name]) {
-    console.log('usage: factory.mjs [--plan <dir>] init | doctor [--stage build] | trust [--yes] | where | prompt <session> --notes-file <f> | check-handback <session> | accept <session> | seal <session> | check-seal <session> | show | set <key> <value> | unset <key> | add <key> <item> | remove <key> <item>');
+    console.log('usage: factory.mjs [--plan <dir>] init | doctor [--stage build] | trust [--yes] | where | prompt <session> --notes-file <f> | findings <session> --round <n> --findings-file <f> | check-handback <session> | accept <session> | seal <session> | check-seal <session> | show | set <key> <value> | unset <key> | add <key> <item> | remove <key> <item>');
     process.exit(2);
   }
   let o;

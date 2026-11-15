@@ -37,8 +37,11 @@ factory-plan/
   handback/
     PROGRESS.md              the conductor's plain-language log
     <session>-PROMPT.md      the prompt one session was started with
-    <session>/handback.md    what the builder handed back, with its summary files
-    <session>/REVIEW.md      the review
+    <session>-FINDINGS-<n>.md  the prompt of findings round n (factory.mjs findings)
+    <session>/handback.md    what the builder handed back (one page), with its summary files
+    <session>/handback-generated.md  the parts the phase command's handback mode writes
+    <session>/review-<n>.md  look n: the reviewer's report, plants and findings labelled
+    <session>/REVIEW.md      the final review record
 ```
 
 ## The config
@@ -52,11 +55,12 @@ factory-plan/
 | `main_branch` | The branch accepted sessions are merged to. |
 | `worktree_root` | Where session worktrees and review clones go. Keep it short: a deep path breaks tools on Windows. |
 | `branch_prefix`, `tag_prefix` | A session `S` is built on `<branch_prefix>S` and accepted as `<tag_prefix>S`. |
-| `builder.model`, `builder.config` | The model the builder runs on, and the rules file: the builder tool's config holding the deny rules. `init` writes the project's own copy to `builder-rules.json` in the plan folder. It can never be empty. |
+| `builder.model`, `builder.config` | The model the builder runs on (by default `cloudflare-workers-ai/@cf/zai-org/glm-5.3`), and the rules file: the builder tool's config holding the deny rules. `init` writes the project's own copy to `builder-rules.json` in the plan folder. It can never be empty. |
 | `builder.thinking` | Whether the builder's reasoning is written to its log. |
 | `models.*` | The model each helper agent runs on: `audit_reviewer`, `finding_verifier`, `plan_reviewer`, `session_reviewer`, `read_list_drafter`. Empty means the model of the chat that starts it. |
 | `commands.install` | What a clean clone needs before anything runs, for example `npm ci`. |
-| `commands.phase`, `commands.mutate` | The one command that decides a session, and the mutation run. `{session}` is replaced by the session id. |
+| `commands.phase`, `commands.mutate` | The one command that decides a session, and the full mutation run (every patch so far, run by the conductor). `{session}` is replaced by the session id. |
+| `commands.sweep` | The line sweep the conductor runs at each tip under review. `{session}` is replaced, and `{since}` by the commit after which lines count. |
 | `stop_policy` | How many failed reviews, unfinished builder turns and stalls a session may have before the loop waits for the owner; whether the conductor pushes after an accept. |
 | `owner_only` | Actions no agent takes. The builder's prompt and the conductor both carry this list. |
 | `builder_must_not_read` | Paths the builder is told not to open, such as the audit and the rejected first plan. |
