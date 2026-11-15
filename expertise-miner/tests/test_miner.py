@@ -491,6 +491,97 @@ class PullTests(Base):
         self.assertEqual(calls, [VID_B])
         self.assertEqual(retry["counts"]["no_transcript"], 1)
 
+    def test_a_resume_tries_refused_videos_and_retry_missing_also_those_with_no_transcript(self):
+        # 10 videos: 2 with no transcript, 3 the site refused (spread out, so that the route stays in).
+        import server as server_mod
+        real, real_need = pull.create_job, server_mod._need_pull_packages
+        self.addCleanup(setattr, pull, "create_job", real)
+        self.addCleanup(setattr, server_mod, "_need_pull_packages", real_need)
+        pull.create_job = lambda spec: (lambda j: (pull.write_job(j), j)[1])(pull.build_job(spec))
+        server_mod._need_pull_packages = lambda: None
+        ids = [f"v{i:010d}" for i in range(10)]
+        disabled, refused = [ids[1], ids[2]], [ids[0], ids[4], ids[9]]
+        calls, refusing = [], [True]
+
+        class TranscriptsDisabled(Exception):
+            pass
+
+        class RequestBlocked(Exception):
+            pass
+
+        def fetcher(vid, langs, proxy):
+            calls.append(vid)
+            if vid in disabled:
+                raise TranscriptsDisabled()
+            if vid in refused and refusing[0]:
+                raise RequestBlocked()
+            return {"segments": SEGS, "language": "en", "is_generated": True}
+
+        first = self.run_job(self.job(details=False), ids, fetcher)
+        self.assertEqual(first["state"], "done")
+        self.assertEqual((first["counts"]["stored"], first["counts"]["no_transcript"], first["counts"]["failed"]),
+                         (5, 2, 3))
+
+        calls.clear()
+        resumed = self.run_job(server_mod.t_pull_resume({"job_id": first["id"]})["id"], ids, fetcher)
+        self.assertEqual(sorted(calls), sorted(refused))                  # only the refused ones are asked for
+        c = resumed["counts"]
+        self.assertEqual((c["skipped_existing"], c["skipped_known_missing"], c["retrying_failed"],
+                          c["retrying_missing"]), (5, 2, 3, 0))
+        self.assertEqual((c["selected"], c["done"]), (10, 10))           # a retried video is done once
+        self.assertIn("tried again after an earlier failure 3", resumed["message"])
+
+        calls.clear()
+        refusing[0] = False                                               # the site answers again
+        retried = self.run_job(server_mod.t_pull_resume({"job_id": resumed["id"], "retry_missing": True})["id"],
+                               ids, fetcher)
+        self.assertEqual(sorted(calls), sorted(refused + disabled))       # and with retry_missing, all five
+        c = retried["counts"]
+        self.assertEqual((c["skipped_known_missing"], c["retrying_failed"], c["retrying_missing"]), (0, 3, 2))
+        self.assertEqual((retried["state"], c["stored"], c["no_transcript"]), ("done", 3, 2))
+        self.assertEqual((c["selected"], c["done"]), (10, 10))
+        self.assertIn("asked again for 2 known to have none (retry_missing)", retried["message"])
+
+    def test_a_miss_recorded_without_its_class_is_tried_again_and_recorded_afresh(self):
+        # A record from another tool or a hand edit, with no permanent flag: treated as transient.
+        st = self.open()
+        with st._lock:
+            st._db.execute("INSERT INTO misses (video_id, reason, permanent, source, at) VALUES (?, NULL, NULL, 't', '')",
+                           (VID_A,))
+            st._db.commit()
+        self.assertFalse(st.get_miss(VID_A)["permanent"])
+
+        class TranscriptsDisabled(Exception):
+            pass
+
+        calls = []
+
+        def fetcher(vid, langs, proxy):
+            calls.append(vid)
+            raise TranscriptsDisabled()
+
+        job = self.run_job(self.job(details=False), [VID_A], fetcher)
+        self.assertEqual((calls, job["counts"]["retrying_failed"]), ([VID_A], 1))
+        self.assertTrue(self.open().get_miss(VID_A)["permanent"])            # recorded afresh, with its class
+        calls.clear()
+        self.run_job(self.job(details=False), [VID_A], fetcher)
+        self.assertEqual(calls, [])                                          # and not asked for again
+
+    def test_a_retry_is_counted_only_when_the_transcript_is_asked_for_again(self):
+        st = self.open()
+        st.record_miss(VID_A, "RequestBlocked", False, "t")
+        st.record_miss(VID_B, "RequestBlocked", False, "t")
+        calls = []
+
+        def fetcher(vid, langs, proxy):
+            calls.append(vid)
+            return {"segments": SEGS, "language": "en", "is_generated": True}
+
+        # min_views ends VID_B (5 views) after its page read: no transcript asked for, not counted
+        job = self.run_job(self.job(min_views=100), [VID_A, VID_B], fetcher)
+        c = job["counts"]
+        self.assertEqual((calls, c["retrying_failed"], c["skipped_min_views"], c["done"]), ([VID_A], 1, 1, 2))
+
     def test_transient_errors_are_retried_then_recorded_as_not_permanent(self):
         tries = []
 

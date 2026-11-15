@@ -333,7 +333,8 @@ def build_job(spec: dict) -> dict:
         # hidden: how many videos yt-dlp said the site hid from the listing ("N unavailable videos are hidden").
         "counts": {"listed": 0, "site_count": None, "hidden": 0, "selected": 0, "done": 0, "stored": 0,
                    "skipped_existing": 0,
-                   "skipped_known_missing": 0, "skipped_min_views": 0, "no_transcript": 0, "failed": 0},
+                   "skipped_known_missing": 0, "retrying_failed": 0, "retrying_missing": 0,
+                   "skipped_min_views": 0, "no_transcript": 0, "failed": 0},
         "failure_reasons": {}, "message": "", "pid": 0,
     }
     return job
@@ -1146,10 +1147,21 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
             if not job["refresh"] and store.has_video(vid):
                 bump("skipped_existing")
                 return "skipped"
-            miss = None if (job["refresh"] or job["retry_missing"]) else store.get_miss(vid)
+            # A recorded miss is permanent (the site said there is no transcript: PERMANENT) or not (it
+            # refused, timed out, the proxy failed). Every version has recorded which, from the same
+            # PERMANENT set. A record without the flag is taken as not permanent: tried again, then
+            # recorded afresh. Permanent ones are skipped unless retry_missing; the others are always
+            # tried again. Those are counted once the transcript is asked for again (not when a stop or
+            # min_views ends the video first), and apart from `done`, which the outcome counts.
+            miss = None if job["refresh"] else store.get_miss(vid)
+            retrying = ""
             if miss and miss.get("permanent"):
-                bump("skipped_known_missing")
-                return "skipped"
+                if not job["retry_missing"]:
+                    bump("skipped_known_missing")
+                    return "skipped"
+                retrying = "retrying_missing"
+            elif miss:
+                retrying = "retrying_failed"
             if job["details"] and not v.get("has_details"):
                 rate.take(stopping)
                 try:
@@ -1170,6 +1182,9 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
             last = ""
             for attempt in range(3):
                 rate.take(stopping)
+                if retrying and attempt == 0:
+                    with lock:
+                        job["counts"][retrying] += 1
                 try:
                     got = fetcher(vid, job["languages"], proxy)
                     if not got["segments"]:
@@ -1308,6 +1323,10 @@ def run_job(job_id: str, *, lister: Callable = list_videos, fetcher: Callable = 
         else:
             msg = (f"stored {c['stored']}, already had {c['skipped_existing']}, "
                    f"no transcript {c['no_transcript'] + c['skipped_known_missing']}, failed {c['failed']}")
+            if c["retrying_failed"]:
+                msg += f"; tried again after an earlier failure {c['retrying_failed']}"
+            if c["retrying_missing"]:
+                msg += f"; asked again for {c['retrying_missing']} known to have none (retry_missing)"
             if out:
                 msg += (f". {len(out)} of {len(usable)} routes were taken out: "
                         + ", ".join(f"{config.mask_proxy(r)} ({why}; {rule})" for r, why, rule in out)
