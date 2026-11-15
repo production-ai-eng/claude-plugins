@@ -56,16 +56,16 @@ The defaults are slow on purpose: one worker and 1.5 seconds between videos. Eac
 
 ## 5. Resume, stop, check coverage
 
-- `pull_resume` with the job id starts again with the same settings and lists again; `workers`, `delay_ms` or `max_requests_per_minute` given to it replace the earlier job's (more workers spread a pull over more routes when one keeps being refused). Videos already stored are skipped, and so are videos recorded as having no transcript, so nothing is asked for twice. Use it after `stopped`, `blocked`, `failed`, `died` or `partial`.
+- `pull_resume` with the job id starts again with the same settings and lists again; `workers`, `delay_ms` or `max_requests_per_minute` given to it replace the earlier job's (more workers spread a pull over more routes when one keeps being refused). Videos already stored are skipped, and so are videos the site said have no transcript or cannot be played (`counts.skipped_known_missing`). Videos that failed for any other reason (refused, timed out, proxy failure) are tried again without any option (`counts.retrying_failed`), so do not set `retry_missing` to get refused videos back: it only adds the no-transcript ones (`counts.retrying_missing`), costs one or two requests each (a transcript fetch, and a page read unless `details: false`), and is worth one pass at the end of a long pull at most, or when other languages are added. Use it after `stopped`, `blocked`, `failed`, `died` or `partial`.
 - `pull_stop` ends a running pull after the request it is on.
 - Running the same `pull_channel` again later picks up new uploads the same way.
 - **Coverage.** In `counts`, `listed` is the entries the listing read, before `max_videos` applied: it is **not** the size of the playlist or channel. `site_count` is the size the site gives (none when it gave none). Compare those with `selected` and `stored`; when `max_videos` left videos out, the end message says how many. `refusals_by_route` counts, per route, videos the site gave no answer for without the route being taken out (`direct` is the user's own address; proxy failures are not counted there): tell the user about any, as a sign the route is going bad. `failure_reasons` says why the rest are missing:
 
 | Reason | Means | Worth retrying |
 |---|---|---|
-| `TranscriptsDisabled`, `NoTranscriptFound` | The video has no captions, or none in the languages asked for | No, unless other languages are added (`retry_missing`) |
-| `VideoUnavailable`, `VideoUnplayable`, `AgeRestricted` | Private, removed, restricted | No |
-| `RequestBlocked`, `IpBlocked` | The site refused this address | Later, or through a proxy |
+| `TranscriptsDisabled`, `NoTranscriptFound` | The video has no captions, or none in the languages asked for | Skipped by `pull_resume`; only with `retry_missing` (other languages added, or captions turned on since) |
+| `VideoUnavailable`, `VideoUnplayable`, `AgeRestricted` | Private, removed, restricted | Skipped by `pull_resume`; only with `retry_missing` |
+| `RequestBlocked`, `IpBlocked` | The site refused this address | Tried again by `pull_resume`, without any option; later, or through a proxy |
 | `ProxyLoginRefused`, `ProxyUnreachable` | The proxy refused the user name or password, or could not be reached. The site was not asked | After the user fixes the proxy in their settings |
 | `ViewCountUnavailable` | `min_views` was set and the video's page could not be read | Yes, with `pull_resume` |
 | Anything else | A network or parsing error | Yes, with `pull_resume` |
