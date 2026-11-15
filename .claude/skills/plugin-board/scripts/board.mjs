@@ -6,6 +6,8 @@
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const REPO = 'production-ai-eng/claude-plugins';
 const OWNER = 'production-ai-eng';
@@ -31,6 +33,23 @@ function gh(args, { json = false, input } = {}) {
 }
 
 function die(msg) { console.error(`plugin-board: ${msg}`); process.exit(1); }
+
+// GitHub's anti-abuse system hides an account that creates content in a burst (it happened here: 21 issues
+// with their comments in two minutes hid the account and stopped its Actions runs). Every command that creates
+// an issue or a comment waits until WRITE_GAP_S has passed since the last one, across separate runs of this
+// script, by keeping the time of the last write in a file in the system temp folder.
+const WRITE_GAP_S = 20;
+function paceWrite() {
+  const stamp = path.join(os.tmpdir(), 'plugin-board-last-write');
+  let last = 0;
+  try { last = Number(fs.readFileSync(stamp, 'utf8')) || 0; } catch {}
+  const wait = last + WRITE_GAP_S * 1000 - Date.now();
+  if (wait > 0) {
+    console.log(`(waiting ${Math.ceil(wait / 1000)} s between writes, so GitHub does not read a burst as spam)`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+  }
+  fs.writeFileSync(stamp, String(Date.now()));
+}
 
 function parseArgs(argv) {
   const pos = [], opt = {};
@@ -153,6 +172,7 @@ const cmds = {
     const args = ['issue', 'create', '-R', REPO, '--title', opt.title, '--body-file', '-'];
     const label = TYPE_LABEL[String(opt.type).toLowerCase()];
     if (label) args.push('--label', label);
+    paceWrite();
     const url = gh(args, { input: text }).trim().split('\n').pop();
     const num = url.split('/').pop();
     console.log(`created #${num}  ${url}`);
@@ -172,6 +192,7 @@ const cmds = {
     if (!/^\d+$/.test(num || '')) die('note needs an issue number');
     const text = body(opt);
     if (!text) die('note needs --text or --body-file');
+    paceWrite();
     gh(['issue', 'comment', num, '-R', REPO, '--body-file', '-'], { input: text });
     console.log(`#${num}: comment added`);
   },
@@ -182,6 +203,7 @@ const cmds = {
     const text = body(opt);
     if (!text) die('close needs --text "what shipped, in which plugin version"');
     const reason = opt['not-planned'] ? 'not planned' : 'completed';
+    paceWrite();
     gh(['issue', 'close', num, '-R', REPO, '--reason', reason, '--comment', text]);
     console.log(`#${num}: closed (${reason})`);
     applyFields(num, resolveFields({ status: 'Done' }));
@@ -205,7 +227,7 @@ const cmds = {
 
 const [cmd, ...rest] = process.argv.slice(2);
 if (!cmds[cmd]) {
-  console.log(`usage: node .claude/skills/plugin-board/scripts/board.mjs <command>
+  console.log(`usage: node <this skill folder>/scripts/board.mjs <command>
   fields                                   the board's fields and their options (read live)
   find <words>                             issues (open and closed) whose text matches
   create --title T --plugin P --type T --priority P [--status S] [--due YYYY-MM-DD] --body-file F

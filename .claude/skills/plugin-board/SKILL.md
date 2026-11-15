@@ -8,11 +8,12 @@ description: File, update and close issues for the production-ai plugins (change
 Issues live in **production-ai-eng/claude-plugins**. The board is the org project **Plugins**
 (github.com/orgs/production-ai-eng/projects/4). The board is the plan: there is no separate roadmap file.
 
-Everything goes through one script, run from the repository root:
+Everything goes through one script, `scripts/board.mjs` in this skill's own folder (the base directory shown when
+the skill loads). It works from any project: it always files into claude-plugins, whatever the current folder is.
 
-    node .claude/skills/plugin-board/scripts/board.mjs <command> ...
+    node "<this skill's folder>/scripts/board.mjs" <command> ...
 
-It uses the person's own `gh` login. If a command fails with a permissions or scope error, tell them to run
+Below, `board.mjs` means that full command. It uses the person's own `gh` login. If a command fails with a permissions or scope error, tell them to run
 `gh auth refresh -s project` once, then retry. Setting board fields needs write access to the project; someone
 without it can still open the issue on GitHub, where it is added to the board automatically, and a maintainer sets the fields.
 
@@ -53,7 +54,7 @@ when the change is to the shared code. Mention the others in the body.
 
 4. **Create it:**
 
-       node .claude/skills/plugin-board/scripts/board.mjs create --title "..." --plugin expertise-miner \
+       board.mjs create --title "..." --plugin expertise-miner \
          --type Bug --priority P1 --body-file <tmp>/body.md [--status Ready] [--due 2026-12-01]
 
    The script checks every field value against the board **before** it creates anything, so a typo creates nothing.
@@ -75,6 +76,10 @@ When someone hands you a document with several issues (a field report, review no
 5. Carry each section's own text into the body (what happened, cause, suggested fix, acceptance check → Done when).
    Do not copy anything person- or machine-specific into a public issue: credentials, usernames, IP addresses, local
    paths, private hostnames or account details. Replace them with a placeholder. The repository is public.
+6. **File slowly.** Run one `create` (and its `close`) at a time, never in a tight loop or in parallel. The script
+   waits 20 seconds between writes on its own; do not work around that. More than about 10 issues: file 10, then
+   tell the person how many are left and continue only when they say so. GitHub hides an account that creates
+   content in a burst and stops its Actions runs; filing 21 issues in two minutes did exactly that.
 
 ## Other jobs
 
