@@ -18,7 +18,7 @@ Reads `audit/AUDIT-REPORT.md` and `direction/DECISIONS.md`. Writes `plan/`, `fix
 
 1. **Vocabulary and rules first.** Fix the words (each state, role, object) and the rules of every session. Write them into `plan/INDEX.md` before any area file, and use them exactly afterwards. Most contradictions in a long plan are two words for one thing.
 2. **Areas.** Cut the system into parts with one owner of each piece of state. One file per part under `plan/areas/`. Every requirement is one numbered sentence a test can show true or false. Put the reasoning next to the requirement.
-3. **Verification design**, `plan/verification.md`: the layers, what stands in for the platform, the fixtures, the mutation list, the phase command and its summary, the handback format. Adapt the standard to the project's language; keep every role in it. Decide the two commands and write them into `factory.config.json` as `commands.phase` and `commands.mutate`, with `{session}`.
+3. **Verification design**, `plan/verification.md`: the layers, what stands in for the platform, the fixtures, the mutation list, the phase command and its summary, the handback format. Adapt the standard to the project's language; keep every role in it. Decide the three commands and write them into `factory.config.json` as `commands.phase`, `commands.mutate` (the full run of every patch so far) and `commands.sweep` (the line sweep, with `{session}` and `{since}`), each with `{session}`. The builder runs only the first, and single patches; the conductor runs all three at each tip.
 4. **Fixtures.** Every expected value that is a matter of design becomes a data file under `fixtures/`, with a manifest of hashes, a provenance note and a checker script.
 5. **Sessions**, `plan/phases.md` and `plan/phases.json`. See below.
 6. **Traceability**, `plan/traceability.md`: every audit finding id to the requirement, session or accepted risk that answers it.
@@ -30,7 +30,7 @@ Long files are written by subagents working from the vocabulary and the decision
 ## Cutting the sessions
 
 - **The first session makes the existing system safe**: stop what should not be running, remove false claims, park what is not being kept. It builds the smallest form of the phase command.
-- **The next sessions build the checking machinery**: the full phase command, the static layer, the mutation tool, the harness and the platform stand-ins. They come before the product code they will judge.
+- **The next sessions build the checking machinery**: the full phase command, the static layer, the mutation tool, the line-sweep tool, the harness and the platform stand-ins. They come before the product code they will judge. The sweep tool is in the first build session, so that every product line is swept from the start (see `verification-standard.md`).
 - **Then the product, one seam per session**, each small enough for one sitting: about eight acceptance tests at most, one part of one area.
 - **A spike before the first session that depends on an unmeasured fact.**
 - **Mark paid or live tests and owner gates** in `phases.json` (`"paid": true`, `"gate": "..."`). The loop stops for them.

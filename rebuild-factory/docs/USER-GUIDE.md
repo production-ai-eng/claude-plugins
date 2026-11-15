@@ -50,8 +50,8 @@ Open a new Claude Code chat afterwards. Type `/mcp` and check that `oc-bridge` i
 The bridge starts OpenCode; it does not sign in for you and holds no credentials.
 
 1. Install OpenCode.
-2. Sign in to a provider: `opencode auth login`.
-3. Find the exact model id: `opencode models`. Copy it into `builder.model` in the settings file when step 1 below asks for it.
+2. Sign in to a provider: `opencode auth login`. The default builder is GLM 5.3 on Cloudflare Workers AI (`cloudflare-workers-ai/@cf/zai-org/glm-5.3`), so sign in to Cloudflare Workers AI unless you choose another model. An Anthropic Sonnet is the usual fallback.
+3. Check the exact model id is offered: `opencode models`. Set-up writes the default into `builder.model`; change it there, through `/factory-config`, if you use another.
 4. Check it works, from any folder:
 
    ```
@@ -155,16 +155,17 @@ Start this in a **fresh chat**, so the conductor is not carrying the audit and p
 For each session, the conductor:
 
 1. **Makes it ready.** Works out exactly what the builder must read, settles any gap in the plan, and writes the builder's prompt.
-2. **Starts the builder** in its own folder, and waits.
-3. **Reads what the builder handed back.** If the builder asked a question the plan answers, the conductor answers it.
-4. **Reviews.** A fresh reviewer copies the repository clean, runs the session's one deciding command, and compares the result with the builder's. Then it breaks things on purpose: it removes a line that makes a decision, or switches off a check, and expects a test to fail.
-5. **Accepts or sends back.** On a pass it merges and tags. On a fail it sends the findings to the same builder and reviews again.
+2. **Starts the builder** in its own folder, and waits. The builder runs only short commands: single test files, and the deciding command once at the end.
+3. **Reads what the builder handed back**: one page. If the builder asked a question the plan answers, the conductor answers it.
+4. **Runs the long checks itself**, on a clean copy of the builder's latest commit: the deciding command, every mutation so far, and the line sweep, which removes each line of code that makes a decision and expects a test to notice.
+5. **Reviews.** A fresh reviewer copies the repository clean, checks the results against the builder's, and breaks things on purpose: it switches off checks, removes what the sweep cannot reach, and tries to disprove each line the builder says cannot be tested.
+6. **Accepts or sends back.** On a pass it merges, tags, cleans up, pushes if you allowed it, and starts making the next session ready in the same breath. On a fail it writes its rulings on each finding, starts a fresh builder conversation in the same folder to answer them, and reviews again: only what changed, plus every earlier finding.
 
 Then it goes straight to the next session.
 
 ## Following along
 
-Open `factory-plan/handback/PROGRESS.md`. After every session the conductor adds a few lines in plain language: the verdict, what exists now that did not, what the review found, any ruling it made that you may overturn, and what changes for later sessions.
+Open `factory-plan/handback/PROGRESS.md`. The conductor adds a dated line whenever something changes (built, a review passed or failed, findings sent back), with how long the session has taken so far; past two hours it says what is taking the time. After every session it adds a few lines in plain language: the verdict, the elapsed time, what exists now that did not, what the review found, any ruling it made that you may overturn, and what changes for later sessions.
 
 To see what the builder is doing at this moment, ask the conductor chat ("what is the builder doing?") or open the live log at `<your home folder>/.oc-bridge/runs/<run id>/log.txt` (the conductor tells you the run id; it is the project name, a short code for the repository, and the session).
 
@@ -180,6 +181,7 @@ It stops, and says why, in these cases:
 | The next step is on your "no agent may" list | You to do it, with the commands it gives you |
 | A question changes the design | Your decision |
 | A session reached the limit of failed reviews or unfinished turns | Your call: continue, raise the limit, or look at the session yourself |
+| Reviews keep moving the edge of one check that can always be dodged one more way | Your decision on what that check must catch; the rest is left to other layers |
 | The machine is out of memory, or a process will not stop | You to free memory or restart |
 | The main branch changed outside the plan | You to say what happened |
 
@@ -198,7 +200,8 @@ If you have lost track entirely, type `/rebuild-factory`. It tells you which sta
 ## What it costs
 
 - **The plan stages cost the most thinking.** Use your strongest model for the audit, the plan and the first plan review.
-- **The build costs time more than money.** As a guide: an hour of building, half an hour of review and twenty minutes of preparation per session, one after another. A rebuild of thirty sessions is days of mostly unattended running, not hours.
+- **The build costs time more than money.** As a guide: about an hour of building, then for each review the conductor's long checks and a review of under an hour. A session commonly needs more than one review, and the first line sweep of a large session takes hours. A rebuild of thirty sessions is days of mostly unattended running, not hours.
+- **Idle time costs more than any model.** A finished builder nobody noticed, or a gap between an accepted session and the next one starting, is time with nothing running. The conductor checks the builder first after any restart and starts the next session in the same turn as an accept; the log shows the time either way.
 - **The builder is the cheap part**, which is why it is a separate, smaller model.
 
 ## Settings
@@ -219,11 +222,12 @@ The settings live in `factory-plan/factory.config.json`. The ones you are most l
 
 | Setting | Meaning |
 |---|---|
-| `builder.model` | The model the builder runs on |
+| `builder.model` | The model the builder runs on (default: GLM 5.3 on Cloudflare Workers AI) |
 | `builder.config` | The builder's rules file: which commands it is refused |
 | `stop_policy.failed_reviews` | Failed reviews of one session before the loop waits for you |
 | `stop_policy.unfinished_turns` | Builder turns that end without a handback before it waits |
-| `stop_policy.push_after_accept` | Whether accepted sessions are pushed automatically |
+| `stop_policy.push_after_accept` | Whether accepted sessions are pushed automatically (the main branch and the tag only) |
+| `commands.phase`, `commands.mutate`, `commands.sweep` | The deciding command, the full mutation run and the line sweep; the plan stage sets them |
 | `owner_only` | The actions no agent takes |
 | `models.audit_reviewer`, `models.finding_verifier`, `models.plan_reviewer`, `models.session_reviewer`, `models.read_list_drafter` | Which model each helper agent runs on. Empty means the same model as the chat. |
 | `builder.thinking` | Whether the builder's reasoning is written to its log |
@@ -271,8 +275,8 @@ For the audit and the plan stages, keep the normal permission prompts on: those 
 |---|---|---|
 | The builder's run shows `failed` or `died` | Its process crashed, usually from low memory | Nothing is lost; the conductor continues the same builder session. Free memory. |
 | The conductor chat restarted | The chat's process ended | Type `/factory-conduct`. The builder was not affected. |
-| A session keeps failing review | The tests do not hold the behaviour, or the plan has a gap | Read the latest `REVIEW.md` in that session's handback folder; the findings are specific |
-| The builder's turn keeps ending without a handback | It ran out of turn, often waiting on a background command | The conductor recovers it and tells it what is still owed; raise the limit if it is making progress |
+| A session keeps failing review | The tests do not hold the behaviour, or the plan has a gap | Read the latest `review-<n>.md` in that session's handback folder; the findings are specific |
+| The builder's turn keeps ending without a handback, or with UNFINISHED at its top | It ran out of turn, often waiting on a background command, or its conversation grew too long | The conductor recovers it, and after a few rounds or an empty turn starts a fresh conversation with only what is left; raise the limit if it is making progress |
 | The script says the plan folder "was not set up on this machine" | The folder came with the repository, or its commands or rules changed outside the tool | Ask the conductor to show you what it holds; say yes only after reading the commands |
 | The conductor reports the plan folder changed during a build | The builder wrote somewhere it was told not to | Read which file; the conductor restores it and sends the session back |
 | The conductor reports a tag that was not recorded | The builder tagged its own work, or the earlier sessions were accepted on another machine | It does not count until recorded; the conductor tells you which it is |
@@ -286,11 +290,13 @@ For the audit and the plan stages, keep the normal permission prompts on: those 
 - **Phase command**: the one command that decides whether a session passes.
 - **Fixture**: a data file of expected values that the plan owns and the builder may not edit.
 - **Mutation**: a small defect put back into the code on purpose; a test must catch it.
-- **Handback**: the builder's report at the end of a session.
+- **Handback**: the builder's one-page report at the end of a session.
+- **Line sweep**: removing each line of code that makes a decision, one at a time, and running the tests; a removal no test notices is a survivor.
+- **Look**: one review of a session. A session that fails one is sent back with findings and looked at again.
 - **Breakage**: a defect the reviewer introduces on purpose to see whether a test notices.
 - **Ruling**: a decision the conductor makes where the plan is silent or contradicts itself; you may overturn it.
 - **Spike**: a session that measures a fact and writes no product code.
 
 ## A note on maturity
 
-The method was drawn from one rebuild that ran this way from audit to build. The helper script and the bridge have been exercised by tests and by an independent red team, on Windows only. The skills and agents have not yet been run on a second codebase, so expect to adjust them the first time, and change the plugin's reference files when you do, not your project.
+The method was drawn from one rebuild that ran this way from audit to build, and the build loop of this version from long build sessions of that same rebuild. The helper script and the bridge have been exercised by tests and by an independent red team, on Windows only. The skills and agents have not yet been run on a second codebase, so expect to adjust them the first time, and change the plugin's reference files when you do, not your project.

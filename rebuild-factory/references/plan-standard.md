@@ -25,8 +25,8 @@ Each block has, in this order:
 | Does not build | What a later session is assigned, where a builder might be tempted to start it. |
 | Tasks | The order of work, where order matters. |
 | Acceptance tests | One row each: id, layer, setup, what must be observed, and the defect it exists to catch. |
-| Mutations | The defects the mutation run puts back for this session, each with the test that must catch it. |
-| Exit | The phase command exits 0; the mutation run exits 0; the handback exists. Plus anything only the owner can do. |
+| Mutations | The defects the mutation run puts back for this session, each with the one test file that must catch it (a patch runs that file, not the whole layer). |
+| Exit | The phase command exits 0 (the builder's run, once at the end); each patch the session moved or changed is killed in its single-patch run; the handback exists. The conductor then runs the phase command, the full mutation run and the line sweep at the tip. Plus anything only the owner can do. |
 | Carried | Findings from the previous review that this session fixes first. The conductor writes this. |
 
 ## Plan-owned fixtures
@@ -58,7 +58,9 @@ These are the ways a first plan usually fails. Check each before spending review
 - **Every platform fact is measured or scheduled.** Search for "should", "probably", "is documented to".
 - **Every requirement has a session, and every session's requirements exist.** A module named in an area file and assigned to no session is found only when its first caller is built.
 - **The reading load is bounded.** No session is told to read a whole area file.
-- **The first sessions build the checking machinery.** The phase command, the static layer and the mutation tool come before the product code they will judge.
+- **The first sessions build the checking machinery.** The phase command, the static layer, the mutation tool and the line-sweep tool come before the product code they will judge. The sweep tool belongs in the first build session: a project that adds it later meets every earlier session's survivors at once.
+- **No test nests the phase command.** A test of the tooling that runs the whole phase command inside itself doubles every run. Test the tool on a small fixture world.
+- **A harness check with no natural edge gets its scope in the plan.** Where a check could always be dodged one more way (a scan of captured output for a secret, say), the plan says what it must catch and what rests on other layers, before a reviewer has to ask.
 - **Nothing depends on the audit.** The builder is told not to open the audit or any rejected draft: code built from a description of the old system is the old system.
 - **Each owner action has a session and exact commands.**
 
