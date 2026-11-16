@@ -21,7 +21,7 @@
 //            the provider cap and the scrub list; the dispatch prints the wait command.
 //   result <dispatch> [--outcome ...] [--head c] [--file f] [--model-ran m]
 //            Worker outcomes are read from the bridge and git; test results from the test run.
-//   test start <dispatch> | test wait <dispatch> (or --state <file>)
+//   test start <dispatch> | test wait <dispatch> (or --state <file>) [--stall-min <n>]
 //   merge record <s> --commit <merge>  |  commit record --kind generated|test_only --commit <c> [--stream <s>]
 //   lane <s>  |  regenerate  |  canary record <role> ok|failed
 //   deploy record <unit> --result ok|failed [--rolled-back] [--verified ok|failed|skipped]
@@ -81,6 +81,10 @@ const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
 
 class Fail extends Error {}
 class NotYet extends Error { constructor(out) { super('not yet'); this.out = out; } }
+// A test wait that saw no output for --stall-min minutes: exit 3, as the bridge's wait does for a worker.
+class Stalled extends Error { constructor(out) { super('stalled'); this.out = out; } }
+const DEFAULT_TEST_TIMEOUT_MIN = 60;
+const DEFAULT_TEST_STALL_MIN = 30;
 const fail = (m) => { throw new Fail(m); };
 
 // ---------- small helpers
@@ -292,6 +296,7 @@ function checkConfig(cfg) {
   if (!['json', 'exit_code'].includes(report)) fail(`${C}: tests.report must be json or exit_code`);
   if (report === 'exit_code' && !(t.required_suites.length === 1 && t.required_suites[0] === 'all')) fail(`${C}: with tests.report exit_code there is one result, so required_suites must be ["all"]`);
   if (report === 'json') for (const k of t.mode === 'ci' ? ['ci_cmd'] : ['stream_cmd', 'combined_cmd']) if (!String(t[k] || '').includes('{report}')) fail(`${C}: tests.${k} must contain {report}: the file it writes its suite results to`);
+  for (const k of ['timeout_min', 'stall_min']) if (t[k] !== undefined && !(typeof t[k] === 'number' && t[k] > 0 && t[k] <= 1440)) fail(`${C}: tests.${k} must be a number of minutes, more than 0 and at most 1440`);
   if (t.regenerated_on_integration !== undefined && (!Array.isArray(t.regenerated_on_integration) || !t.regenerated_on_integration.every((x) => t.required_suites.includes(x)))) fail(`${C}: tests.regenerated_on_integration must list required suites`);
   if (typeof cfg.worker_rules !== 'string' || !cfg.worker_rules || path.isAbsolute(cfg.worker_rules) || cfg.worker_rules.includes('..')) fail(`${C}: worker_rules must be a path inside the repository (relative to its root)`);
   const names = new Set();
@@ -1113,6 +1118,9 @@ function cmdResult(o) {
       if (rep && typeof rep === 'object') for (const [k, v] of Object.entries(rep)) suites[k] = v === 'pass' ? 'pass' : 'fail';
       if (!Object.keys(suites).length) suites = Object.fromEntries(c.cfg.tests.required_suites.map((x) => [x, 'fail']));
     } else suites = { all: s.exit_code === 0 ? 'pass' : 'fail' };
+    // A run stopped at its limit fails whatever its report says: a report written before a hang in teardown
+    // is not a finished run.
+    if (s.timed_out) { suites = Object.fromEntries(c.cfg.tests.required_suites.map((x) => [x, 'fail'])); ev.timed_out = true; out.note = `the run was stopped at tests.timeout_min (${s.timeout_min} min): every required suite recorded as failed`; }
     outcome = 'done';
     Object.assign(ev, { suites, exit_code: s.exit_code, sha: tr.sha });
     Object.assign(out, { suites, exit_code: s.exit_code, sha: tr.sha });
@@ -1132,7 +1140,7 @@ const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); }
 function cmdTest(o) {
   const [verb, id] = o._;
   if (verb === 'wait') return testWait(o, id);
-  if (verb !== 'start') fail('usage: test start <dispatch> --lease <id> | test wait <dispatch> | test wait --state <file>');
+  if (verb !== 'start') fail('usage: test start <dispatch> --lease <id> | test wait <dispatch> | test wait --state <file> [--stall-min <n>]');
   const c = ctx(); needLease(c, o.lease);
   const d = c.st.dispatches[id] || fail(`no dispatch ${id}`);
   if (d.role !== 'ci') fail(`${id} is not a test dispatch`);
@@ -1153,8 +1161,12 @@ function cmdTest(o) {
   const report = path.join(folder, 'report.json');
   const state = path.join(folder, 'state.json');
   const command = cmd.replaceAll('{sha}', d.target).replaceAll('{report}', JSON.stringify(report));
-  fs.writeFileSync(state, JSON.stringify({ status: 'starting', command, dir, log: path.join(folder, 'log.txt'), started_at: new Date().toISOString() }, null, 2));
-  const waitCommand = `node "${SELF}" test wait --state "${state}"`;
+  // A test that never ends must still end the run: the runner stops it at timeout_min, and the wait wakes
+  // the chat when the log has been quiet for stall_min.
+  const timeoutMin = t.timeout_min || DEFAULT_TEST_TIMEOUT_MIN;
+  const stallMin = t.stall_min || DEFAULT_TEST_STALL_MIN;
+  fs.writeFileSync(state, JSON.stringify({ status: 'starting', command, dir, log: path.join(folder, 'log.txt'), timeout_min: timeoutMin, started_at: new Date().toISOString() }, null, 2));
+  const waitCommand = `node "${SELF}" test wait --state "${state}" --stall-min ${stallMin}`;
   record(c, 'test.started', { dispatch: id, sha: d.target, dir, command, state, report, report_mode: t.report || 'exit_code', wait_command: waitCommand }, o.lease);
   // The runner is detached and runs with the worker scrub list applied to its environment.
   const child = spawn(process.execPath, [SELF, '_testrun', state], { detached: true, stdio: 'ignore', windowsHide: true, env: scrubbedEnv(c.cfg.worker_env_scrub) });
@@ -1168,6 +1180,9 @@ const runnerGone = (s) => !!s.runner_pid && pidAlive(s.runner_pid) === false;
 async function testWait(o, id) {
   let state = o.state;
   if (!state) { const c = lockedRead(() => ctx()); state = c.st.testRuns[id]?.state || fail(`${id} has no test run`); }
+  const stallMin = o['stall-min'] === undefined ? 0 : Number(o['stall-min']);
+  if (!(stallMin >= 0 && stallMin <= 1440)) fail('--stall-min takes minutes, 0 (off) to 1440');
+  let lastLook = null, quietSince = Date.now();
   for (;;) {
     const s = readJson(state) || fail(`no test run record at ${state}`);
     if (s.status !== 'ended' && runnerGone(s) && readJson(state)?.status !== 'ended') {
@@ -1175,8 +1190,19 @@ async function testWait(o, id) {
     }
     if (s.status === 'ended') {
       const out = { status: s.status, exit_code: s.exit_code, log: s.log, tail: (readOr(s.log, '') || '').split(/\r?\n/).slice(-20).join('\n') };
+      if (s.timed_out) out.note = `the run was stopped at its limit (tests.timeout_min, ${s.timeout_min} min) and counts as failed: a test that never ends, or a limit too low for this suite`;
       if (s.exit_code !== 0) throw new NotYet(out);
       return out;
+    }
+    if (stallMin) {
+      let look = 'absent';
+      try { const st = fs.statSync(s.log); look = `${st.size}:${st.mtimeMs}`; } catch { /* no output yet */ }
+      if (look !== lastLook) { lastLook = look; quietSince = Date.now(); }
+      else if (Date.now() - quietSince >= stallMin * 60000) {
+        throw new Stalled({ status: s.status, stalled: true, quiet_minutes: +((Date.now() - quietSince) / 60000).toFixed(1), log: s.log,
+          tail: (readOr(s.log, '') || '').split(/\r?\n/).slice(-20).join('\n'),
+          meaning: `the test has printed nothing for ${stallMin} min while still running. It may hang (the runner stops it at tests.timeout_min, ${s.timeout_min || DEFAULT_TEST_TIMEOUT_MIN} min, and records it failed), or the suite may be slow and quiet. Read the tail; start the wait again to keep waiting.` });
+      }
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -1186,19 +1212,38 @@ function runTest(stateFile) {
   const s = readJson(stateFile);
   if (!s) process.exit(2);
   const out = fs.openSync(s.log, 'a');
-  const done = (code, note) => {
+  let ended = false;
+  const done = (code, note, extra = {}) => {
+    if (ended) return;
+    ended = true;
     const e = readJson(stateFile) || s;
     if (note) fs.writeSync(out, `\n[change-factory] ${note}\n`);
-    Object.assign(e, { status: 'ended', exit_code: code, ended_at: new Date().toISOString() });
+    Object.assign(e, { status: 'ended', exit_code: code, ended_at: new Date().toISOString() }, extra);
     fs.writeFileSync(stateFile, JSON.stringify(e, null, 2));
     process.exit(0);
   };
   let child;
-  try { child = spawn(s.command, { cwd: s.dir, shell: true, stdio: ['ignore', out, out], windowsHide: true }); }
+  // Elsewhere than Windows the command gets its own process group, so that the whole tree can be stopped.
+  try { child = spawn(s.command, { cwd: s.dir, shell: true, stdio: ['ignore', out, out], windowsHide: true, detached: process.platform !== 'win32' }); }
   catch (e) { return done(-1, 'could not start: ' + e.message); }
   s.status = 'running'; s.pid = child.pid; s.runner_pid = process.pid; fs.writeFileSync(stateFile, JSON.stringify(s, null, 2));
   child.on('error', (e) => done(-1, 'could not start: ' + e.message));
   child.on('exit', (code) => done(code ?? -1));
+  const limitMin = Number(s.timeout_min) || DEFAULT_TEST_TIMEOUT_MIN;
+  setTimeout(() => {
+    killTree(child.pid);
+    done(124, `timed out after ${limitMin} min (tests.timeout_min): the test command and everything it started were stopped; the run counts as failed`, { timed_out: true });
+  }, limitMin * 60000);
+}
+
+// Stop a process and everything it started. On Windows through taskkill's tree option; elsewhere through
+// the process group the runner gave the command.
+function killTree(pid) {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 30000 });
+    else process.kill(-pid, 'SIGKILL');
+  } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
 }
 
 // What git alone makes of a merge: the tree it writes (with conflict markers where it could not
@@ -1792,7 +1837,7 @@ const SPEC = {
   stream: [['title', 'tier', 'ship', 'lease'], []], brief: [['file', 'lease'], []],
   dispatch: [['role', 'model', 'target', 'on', 'expect', 'dir', 'prompt-file', 'lease'], []],
   result: [['outcome', 'head', 'file', 'model-ran', 'lease'], []],
-  test: [['lease', 'state'], []],
+  test: [['lease', 'state', 'stall-min'], []],
   merge: [['commit', 'lease'], []], lane: [['lease'], []], commit: [['kind', 'commit', 'stream', 'lease'], []], regenerate: [['lease'], []],
   canary: [['lease'], []], deploy: [['result', 'verified', 'lease'], ['rolled-back']], carry: [['kind', 'text', 'why', 'lease'], []],
   owner: [['text', 'what', 'why', 'head', 'tier', 'ship', 'lease'], [], ['from']],
@@ -1827,6 +1872,7 @@ else {
     if (name === 'hook') { print(decide('ask', `the guard failed (${String(e?.message || e).slice(0, 200)}), so it asks.`)); process.exit(0); }
     if (name === 'session-start') process.exit(0);
     if (e instanceof NotYet) { print(e.out); process.exit(1); }
+    if (e instanceof Stalled) { print(e.out); process.exit(3); }
     if (e instanceof Fail) { console.error('change-factory: ' + e.message); process.exit(2); }
     console.error(e?.stack || String(e));
     process.exit(2);

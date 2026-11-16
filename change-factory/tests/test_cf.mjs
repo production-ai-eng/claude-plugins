@@ -310,11 +310,50 @@ r = sh(['result', c1.dispatch, '--outcome', 'done', '--suite', 'unit=pass', ...L
 ok('Q-M7 suites cannot be typed in: they are read from the run', r.code === 2 && /--suite/.test(r.out), r.out);
 ci({ unit: 'pass', api: 'pass', golden: 'fail' });
 r = sh(['test', 'start', c1.dispatch, ...LB]);
-ok('Q-M7 the helper starts the test run itself, on the exact commit, and returns its wait command', r.code === 0 && J(r)?.sha === s1h3 && /test wait/.test(J(r)?.wait_command || ''), r.out);
+ok('Q-M7 the helper starts the test run itself, on the exact commit, and returns its wait command', r.code === 0 && J(r)?.sha === s1h3 && /test wait .* --stall-min 30$/.test(J(r)?.wait_command || ''), r.out);
 r = sh(['test', 'wait', c1.dispatch]);
 ok('Q-M7 test wait blocks until the run ends; exit 1 when a suite failed', r.code === 1, r.out);
 r = sh(['result', c1.dispatch, ...LB]);
 ok('Q-M7 the result is read from the run\'s own report, per suite', r.code === 0 && J(r)?.suites?.unit === 'pass' && J(r)?.suites?.golden === 'fail', r.out);
+
+// A test that never ends: the runner stops it, and everything it started, at tests.timeout_min; a quiet
+// run wakes the wait at --stall-min (exit 3).
+{
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const hangDir = path.join(T, 'hang'); fs.mkdirSync(hangDir);
+  const forever = `"${process.execPath}" -e "require('fs').writeFileSync('child-'+Date.now()+'.pid', String(process.pid)); console.log('started'); setInterval(() => {}, 1000)"`;
+  const st1 = path.join(hangDir, 'state1.json');
+  fs.writeFileSync(st1, JSON.stringify({ status: 'starting', command: forever, dir: hangDir, log: path.join(hangDir, 'log1.txt'), timeout_min: 0.03 }));
+  const t0 = Date.now();
+  spawnSync(process.execPath, [CF, '_testrun', st1], { env: ENV, stdio: 'ignore', timeout: 60000 });
+  const s1 = JSON.parse(fs.readFileSync(st1, 'utf8'));
+  ok('a test that never ends is stopped at tests.timeout_min and recorded as failed', s1.status === 'ended' && s1.exit_code === 124 && s1.timed_out === true && Date.now() - t0 >= 1500, JSON.stringify(s1));
+  // The test's own process (a grandchild of the runner, under the shell), named by the pid it wrote.
+  const childPid = Number(fs.readFileSync(path.join(hangDir, fs.readdirSync(hangDir).find((f) => f.endsWith('.pid'))), 'utf8'));
+  let gone = false; for (let i = 0; i < 50 && !gone; i++) { gone = !alive(s1.pid) && !alive(childPid); if (!gone) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},100)']); }
+  ok('the stopped test\'s own process is gone too, not only its shell', childPid > 0 && gone, `${s1.pid} ${childPid}`);
+  ok('the log says why the run ended', /timed out after 0\.03 min/.test(fs.readFileSync(s1.log, 'utf8')));
+  r = sh(['test', 'wait', '--state', st1]);
+  ok('test wait on a timed-out run exits 1 and says it was stopped at its limit', r.code === 1 && /timeout_min/.test(J(r)?.note || ''), r.out);
+
+  const st2 = path.join(hangDir, 'state2.json');
+  fs.writeFileSync(st2, JSON.stringify({ status: 'starting', command: forever, dir: hangDir, log: path.join(hangDir, 'log2.txt'), timeout_min: 1 }));
+  const runner = spawn(process.execPath, [CF, '_testrun', st2], { env: ENV, stdio: 'ignore', detached: true });
+  runner.unref();
+  for (let i = 0; i < 50 && JSON.parse(fs.readFileSync(st2, 'utf8')).status !== 'running'; i++) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},100)']);
+  const t1 = Date.now();
+  r = sh(['test', 'wait', '--state', st2, '--stall-min', '0.02']);
+  ok('test wait exits 3 when the run has printed nothing for --stall-min', r.code === 3 && J(r)?.stalled === true && /started/.test(J(r)?.tail || '') && Date.now() - t1 >= 1000, r.out);
+  r = sh(['test', 'wait', '--state', st2, '--stall-min', '-1']);
+  ok('test wait refuses a negative stall limit', r.code === 2, r.out);
+  const s2 = JSON.parse(fs.readFileSync(st2, 'utf8'));
+  // Stop the test's whole tree first (it holds hangDir open; with its shell gone first, the tree could not be
+  // walked), then the runner, and wait for the runner to be gone.
+  if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(s2.pid), '/T', '/F'], { stdio: 'ignore' });
+  else { try { process.kill(-s2.pid, 'SIGKILL'); } catch { try { process.kill(s2.pid, 'SIGKILL'); } catch { /* gone */ } } }
+  try { process.kill(s2.runner_pid); } catch { /* gone, or it ended on the kill */ }
+  for (let i = 0; i < 50 && (alive(s2.runner_pid) || alive(s2.pid)); i++) spawnSync(process.execPath, ['-e', 'setTimeout(()=>{},100)']);
+}
 
 // stream s2: another edit of the same line (a planted conflict)
 const dS2 = J(sh(['dispatch', 's2', '--role', 'worker', '--dir', wt2, '--prompt-file', PROMPT, ...LB]));
