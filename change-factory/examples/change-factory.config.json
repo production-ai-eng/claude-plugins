@@ -24,6 +24,8 @@
     "combined_cmd": "npm test",
     "report": "exit_code",
     "required_suites": ["all"],
+    "timeout_min": 60,
+    "stall_min": 30,
     "regenerated_on_integration": []
   },
   "generated": { "commands": [], "paths": [] },

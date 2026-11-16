@@ -56,7 +56,11 @@ worker does. Read `${CLAUDE_PLUGIN_ROOT}/references/method.md` first. Run the he
    round_reviewer>`.
 6. **MERGEABLE**: test it. `dispatch <s> --role ci` (refused unless the code head was reviewed MERGEABLE), then
    `test start <dispatch>`, start the printed wait command in the background, and when it ends
-   `result <dispatch>`. The helper reads the result from the run; you never type it. Suites listed in
+   `result <dispatch>`. The helper reads the result from the run; you never type it. The runner stops a test
+   at `tests.timeout_min` and records it failed (`timed_out`). The wait exits 3 when the run has printed
+   nothing for `tests.stall_min`: read the tail it prints, tell the owner if the test looks stuck, and in
+   every case start the wait again in the background. It ends with exit 1 when the runner stops the test at
+   the limit; then `result <dispatch>` records it failed. Do not stop a test run some other way. Suites listed in
    `regenerated_on_integration` may fail here; they count on the integration branch.
 7. **Red team before the merge** (only a stream named in `roles.pre_merge_red_team.streams`): once its head is
    reviewed MERGEABLE and green, `dispatch <s> --role pre_merge_red_team` prints the model, the target (the
@@ -127,7 +131,12 @@ for the owner.
 2. `research_runner` empty: start the `research-analyst` agent on the printed model with the item as the owner
    put it, the owner's decisions, the brief if there is one, the repository path and the finding path. Not
    empty: run that command as a **background** shell command (the owner accepted it in `trust`), then give its
-   output to the `research-analyst` agent as material. If the runner cannot run the item, tell the owner; do
+   output to the `research-analyst` agent as material. Never start it bare: in bash, start it as
+   `timeout 3600 <runner command> > <file> 2>&1` (an hour, unless the owner set another limit; the Windows
+   `timeout.exe` of cmd or PowerShell only pauses and limits nothing), and look at the file's age at every
+   turn. Output that has not changed for 30 minutes means it hangs: stop it, and anything it started that
+   is still running, and tell the owner. `timeout` stops the runner; a process the runner started apart from
+   itself may survive it. If the runner cannot run the item, tell the owner; do
    not run the research some other way on this machine.
 3. `result <dispatch> --outcome done --file <finding path>` (the helper refuses another file than `--expect`).
    Commit the finding on the integration branch (a record file).

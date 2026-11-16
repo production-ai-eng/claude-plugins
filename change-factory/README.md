@@ -75,7 +75,9 @@ The plugin itself has driven no real run yet. The method was run once by hand be
   the strongest model you configure (a stale verdict, a paid owed pass or a stand-in adds a pass; all count
   in `max_red_team_passes`).
 - Tests: local by default (on your machine, in the stream's worktree); with `tests.mode` `ci`, each test run
-  is a run of your CI command.
+  is a run of your CI command. A test run is stopped at `tests.timeout_min` (default 60), with everything it
+  started, and counts as failed; its wait wakes the chat (exit 3) when the run has printed nothing for
+  `tests.stall_min` (default 30). Set both above your slowest normal run.
 - A resume after an account switch sends one line to each role's model (the canary).
 - Budgets (`max_worker_runs`, `max_rounds_per_stream`, `max_ci_runs`, `max_red_team_passes`) are counted by the
   helper at dispatch; the run stops for the owner when one is used up. The owner changes a budget of the open
@@ -111,7 +113,7 @@ means something reports it once it happened. "Instructed only" means a model is 
 | Main moved under the run | `finish-check` refuses unless main still equals the run's base and every code unit is recorded ok (or the owner moves main without it) | — | — |
 | Credentials in the worker's environment | `worker_env_scrub` drops matching variables from workers and local test runs | — | Credential files stay readable |
 | Two conductors on one run, or two commands at once | Every write needs the current lease; a takeover is recorded. Every command holds the project's lock from its first read to its last write, so two at once cannot both pass a gate or take the same id | — | A lease stops accidents, not a determined session: any session can pass the id |
-| Waits that never wake the chat | A test wait ends (exit 2) when the test runner's process is gone; that run is recorded as failed | — | Background shell commands only (the run skill) |
+| Waits that never wake the chat | A test wait ends (exit 2) when the test runner's process is gone; that run is recorded as failed. A test that never ends is stopped at `tests.timeout_min`, with the processes it started (`taskkill /T` on Windows, its process group elsewhere), and every required suite is recorded as failed, whatever its report says | The wait exits 3 when the run's output has been quiet for `tests.stall_min` | Background shell commands only, and the research runner under a time limit (the run skill). A process the test started apart from its own tree (a grandchild whose parent already exited, on Windows; a `setsid` elsewhere) is not stopped |
 | Stray runs after a wave | — | `strays` lists bridge runs with no open dispatch (bridge runs only; a subagent's own shells are not visible) | Stop them after each wave |
 
 ### What the hook was measured to do
