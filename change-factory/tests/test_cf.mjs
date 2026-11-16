@@ -219,7 +219,7 @@ const bstate = (id) => { try { return JSON.parse(fs.readFileSync(path.join(BHOME
 const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
 const st1 = bstate('r1-s1-r1-a1');
 ok('Q-M3 the helper started the run itself, with the trusted rules, the provider cap and the scrub list', st1?.rules_sha256 === sha(goodRules) && st1?.max_concurrent >= 1 && JSON.stringify(st1?.scrub_env) === '["CLOUD_*"]' && st1?.model === 'prov/worker-1', JSON.stringify(st1).slice(0, 300));
-ok('Q-M3 the dispatch returns the wait command for a background shell', /oc\.mjs" wait r1-s1-r1-a1/.test(d1?.wait_command || ''), JSON.stringify(d1));
+ok('Q-M3 the dispatch returns the wait command for a background shell', /oc\.mjs" wait r1-s1-r1-a1 --stall-min \d+ --max-min 120$/.test(d1?.wait_command || ''), JSON.stringify(d1));
 r = sh(['dispatch', 's2', '--role', 'worker', '--dir', wt2, '--prompt-file', PROMPT, ...LB]);
 ok('W3 a second worker on a provider capped at 1 is refused', r.code === 2 && /provider "prov"/.test(r.out), r.out);
 waitRun(d1.run_id);

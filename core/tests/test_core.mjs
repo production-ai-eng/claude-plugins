@@ -87,6 +87,8 @@ const mode = process.env.STUB_MODE || 'ok';
 fs.writeFileSync('env-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.json', JSON.stringify(Object.keys(process.env)));
 if (mode === 'hold') { setTimeout(() => {}, 60000); }
 else if (mode === '429') { console.log('working'); console.error('Error: 429 Too Many Requests: rate limit reached for this model'); process.exit(1); }
+else if (mode === 'quietloop') { console.log('one line, then silence'); setInterval(() => {}, 1000); }
+else if (mode === 'loudloop') { setInterval(() => console.log('still going ' + Date.now()), 200); }
 else if (mode === 'auth') { console.error('Error: 401 Unauthorized: invalid api key'); process.exit(1); }
 else if (mode === 'quota') { console.error('Error: insufficient credits on this account'); process.exit(1); }
 else if (mode === 'other') { console.error('TypeError: x is not a function'); process.exit(1); }
@@ -171,6 +173,36 @@ fs.writeFileSync(lk, String(dead));
 took = false;
 try { store.withLock(lk, () => { took = true; }, { waitMs: 1000, staleMs: 60_000 }); } catch (e) { err = e.message; }
 ok('L2 a lock whose holder is gone is taken over at once', took && !fs.existsSync(lk), err);
+
+// wait: exit 3 when the run is silent for --stall-min; exit 4 when it keeps printing past --max-min. Neither stops it.
+{
+  // stop a run and wait until its process is gone, so that it holds no folder open at cleanup
+  const stopGone = (id) => {
+    oc(['stop', id]);
+    for (let i = 0; i < 100; i++) {
+      const pid = BJ(oc(['status', id]))?.pid;
+      let alive = false; try { if (pid) { process.kill(pid, 0); alive = true; } } catch { /* gone */ }
+      if (!alive) return;
+      execFileSync(process.execPath, ['-e', 'setTimeout(()=>{},100)']);
+    }
+  };
+  startRun('quiet', ['--model', 'prov/m-1'], { STUB_MODE: 'quietloop' });
+  // A wait that never returns would hang the suite: these calls run under a time limit instead.
+  const ocT = (args) => { try { return { code: 0, out: execFileSync(process.execPath, [OC, ...args], { encoding: 'utf8', env: BENV, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 }) }; } catch (e) { return { code: e.status, out: String(e.stdout || '') + String(e.stderr || ''), timedOut: e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM' }; } };
+  let w = ocT(['wait', 'quiet', '--stall-min', '0.02']);
+  ok('a run silent for --stall-min wakes the wait with exit 3', w.code === 3 && /"stalled": true/.test(w.out), w.out);
+  ok('the stall wake does not stop the run', BJ(oc(['status', 'quiet']))?.status === 'running');
+  stopGone('quiet');
+  startRun('loud', ['--model', 'prov/m-1'], { STUB_MODE: 'loudloop' });
+  w = ocT(['wait', 'loud', '--stall-min', '30', '--max-min', '0.03']);
+  ok('a run that keeps printing is not a stall, and --max-min wakes the wait with exit 4', w.code === 4 && /"over_max": true/.test(w.out) && /"stalled": false/.test(w.out), w.out);
+  ok('the max wake does not stop the run', BJ(oc(['status', 'loud']))?.status === 'running');
+  stopGone('loud');
+  for (const [flag, bad] of [['max-min', '0'], ['max-min', '-1'], ['max-min', 'x'], ['stall-min', '0'], ['stall-min', 'x']]) {
+    w = ocT(['wait', 'loud', '--' + flag, bad]);
+    ok(`wait refuses --${flag} ${bad}`, w.code === 2 && w.out.includes('--' + flag), w.out);
+  }
+}
 
 fs.rmSync(T, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${failed.length} failed`);

@@ -8,7 +8,7 @@
 //                      [--max-concurrent <n>] [--scrub-env NAME,PREFIX_*,...]
 //   node oc.mjs answer <run-id> (--prompt-file <f> | --prompt <text>)
 //   node oc.mjs status <run-id> [--tail <lines>]
-//   node oc.mjs wait   <run-id> [--stall-min <minutes>]     exits when the run ends
+//   node oc.mjs wait   <run-id> [--stall-min <minutes>] [--max-min <minutes>]   exits when the run ends
 //   node oc.mjs stop   <run-id>
 //   node oc.mjs list
 //
@@ -485,14 +485,21 @@ function runTurn(id) {
   child.on('exit', (code, signal) => finish(code ?? -1, signal ? 'ended by signal ' + signal : null));
 }
 
-async function waitFor({ id, stallMin = 0 }) {
+// stallMin: wake when the run has printed nothing for that long. maxMin: wake when the wait has lasted that
+// long, even while the run keeps printing (a test that loops and logs inside a worker run). Either wakes the
+// caller; neither stops the run.
+async function waitFor({ id, stallMin = 0, maxMin = 0, poll = 5000 }) {
+  const started = Date.now();
   for (;;) {
     const s = status({ id, tail: 0 });
     if (s.status !== 'running' && s.status !== 'starting') return { ...status({ id, tail: 40 }), stalled: false };
     if (stallMin && s.seconds_since_output !== null && s.seconds_since_output > stallMin * 60) {
       return { ...status({ id, tail: 40 }), stalled: true };
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    if (maxMin && Date.now() - started >= maxMin * 60000) {
+      return { ...status({ id, tail: 40 }), stalled: false, over_max: true, waited_minutes: +((Date.now() - started) / 60000).toFixed(1) };
+    }
+    await new Promise((r) => setTimeout(r, Math.min(poll, maxMin ? Math.max(200, maxMin * 15000) : poll)));
   }
 }
 
@@ -525,10 +532,16 @@ async function main() {
     case 'stop': return print(stop({ id }));
     case 'list': return print(list());
     case 'wait': {
-      const r = await waitFor({ id, stallMin: o.stallMin ? Number(o.stallMin) : 0 });
+      const num = (v, name) => {
+        if (v === undefined) return 0;
+        const n = Number(v);
+        if (!(n > 0 && n <= 10080)) throw new BridgeError(`--${name} takes minutes, more than 0 and at most 10080`);
+        return n;
+      };
+      const r = await waitFor({ id, stallMin: num(o.stallMin, 'stall-min'), maxMin: num(o.maxMin, 'max-min') });
       const { tail, ...head } = r;
       print(head); console.log('----- last output -----\n' + tail);
-      process.exit(r.stalled ? 3 : r.status === 'finished' ? 0 : 1);
+      process.exit(r.stalled ? 3 : r.over_max ? 4 : r.status === 'finished' ? 0 : 1);
     }
     default:
       print('usage: oc.mjs start|answer|status|wait|stop|list  (see the header of this file)');

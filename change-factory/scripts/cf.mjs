@@ -261,7 +261,7 @@ function checkRole(name, r) {
   if (r.fallback !== undefined && (!Array.isArray(r.fallback) || !r.fallback.every((m) => typeof m === 'string' && okModel(m)))) fail(`roles.${name}.fallback must be a list of ${what}`);
   if (r.on_fallback !== undefined && !['owed_pass', 'ok'].includes(r.on_fallback)) fail(`roles.${name}.on_fallback must be owed_pass or ok`);
   if (r.effort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max'].includes(r.effort)) fail(`roles.${name}.effort must be low, medium, high, xhigh or max`);
-  for (const k of ['escalate_after', 'stall_min']) if (r[k] !== undefined && !(Number.isInteger(r[k]) && r[k] >= 1)) fail(`roles.${name}.${k} must be a whole number, 1 or more`);
+  for (const k of ['escalate_after', 'stall_min', 'max_min']) if (r[k] !== undefined && !(Number.isInteger(r[k]) && r[k] >= 1)) fail(`roles.${name}.${k} must be a whole number, 1 or more`);
 }
 
 function checkConfig(cfg) {
@@ -969,7 +969,9 @@ function cmdDispatch(o) {
       const running = Object.values(c.st.dispatches).filter((d) => !d.result && d.via === 'opencode' && d.model.split('/')[0] === provider).length;
       if (running >= limit) fail(`provider "${provider}" has ${running} worker(s) running; the limit now is ${limit} (provider cap ${cap ?? 'none'}, machine ${mem})`);
       const stall = c.cfg.roles[role].stall_min || 20;
-      Object.assign(out, { rules: rulesAbs(c.repo, c.cfg), scrub_env: c.cfg.worker_env_scrub || [], thinking: !!c.cfg.roles[role].thinking, stall_min: stall, max_concurrent: limit });
+      // A worker whose test loops while it logs is never silent: the wait also wakes at max_min (exit 4).
+      const maxMin = c.cfg.roles[role].max_min || 120;
+      Object.assign(out, { rules: rulesAbs(c.repo, c.cfg), scrub_env: c.cfg.worker_env_scrub || [], thinking: !!c.cfg.roles[role].thinking, stall_min: stall, max_min: maxMin, max_concurrent: limit });
       // The intent is recorded before the start, so a crash in between is visible to reconcile.
       record(c, 'dispatch', ev, o.lease);
       try {
@@ -978,7 +980,7 @@ function cmdDispatch(o) {
         record(c, 'result', { dispatch: id, outcome: 'not_started', error: String(e.message || e) }, o.lease);
         fail(`the worker did not start: ${e.message || e}`);
       }
-      out.wait_command = `node "${BRIDGE_OC}" wait ${ev.run_id} --stall-min ${stall}`;
+      out.wait_command = `node "${BRIDGE_OC}" wait ${ev.run_id} --stall-min ${stall} --max-min ${maxMin}`;
       out.next = 'run wait_command as a BACKGROUND shell command; when it exits, record the result (result ' + id + ')';
       return out;
     }
