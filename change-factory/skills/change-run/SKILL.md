@@ -39,6 +39,10 @@ worker does. Read `${CLAUDE_PLUGIN_ROOT}/references/method.md` first. Run the he
      (same round, next attempt) unless the cause needs the owner (quota, auth: tell them).
    - The wait exited 3 (no output for the stall time): read `opencode_status`. If it is stuck, `opencode_stop`
      it, then `result <dispatch> --outcome stalled`.
+   - The wait exited 4 (the run is still going after `roles.<role>.max_min` minutes of waiting, default 120; a
+     new wait starts the clock again): read the log tail. A run that
+     repeats the same output (a test that loops while it logs) is stuck: `opencode_stop` it, then
+     `result <dispatch> --outcome stalled`. One making progress: start the wait again.
 3. **Lane**: `lane <s>`. Outside the owned paths, or line endings rewritten, makes the stream red-team eligible.
    `merge record` checks the lane again itself, so a skipped `lane` does not hide it.
 4. **Review** on an independent model: `dispatch <s> --role round_reviewer` prints the model, the target head

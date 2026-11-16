@@ -8,7 +8,7 @@
   "hook_mode": "deny",
   "roles": {
     "brief_writer": { "via": "subagent", "model": "opus", "effort": "high" },
-    "worker": { "via": "opencode", "model": "provider/model-id", "thinking": false, "escalate_after": 3, "stall_min": 20 },
+    "worker": { "via": "opencode", "model": "provider/model-id", "thinking": false, "escalate_after": 3, "stall_min": 20, "max_min": 120 },
     "worker_escalation": { "via": "subagent", "model": "opus" },
     "round_reviewer": { "via": "subagent", "model": "opus", "fallback": ["sonnet"], "on_fallback": "ok" },
     "stream_red_team": { "via": "subagent", "model": "fable", "fallback": ["opus"], "on_fallback": "owed_pass" },

@@ -23,11 +23,11 @@ A run is **auto-approved** by default: OpenCode does whatever its rules do not d
 | `opencode_status` | `node oc.mjs status <id> [--tail 50]` | Status, exit code, how it ended (`end_kind`), seconds since last output, whether the rules file changed, end of the log. |
 | `opencode_stop` | `node oc.mjs stop <id>` | Stops the run. The session can still be continued. |
 | `opencode_list` | `node oc.mjs list` | Every run, newest first. |
-| (none) | `node oc.mjs wait <id> [--stall-min 20]` | Blocks until the run ends. Exit 0 finished, 1 failed or stopped, 3 nothing printed for the stall time. |
+| (none) | `node oc.mjs wait <id> [--stall-min <n>] [--max-min <n>]` | Blocks until the run ends. Both limits are off unless given. Exit 0 finished, 1 failed or stopped, 3 nothing printed for the stall time, 4 the wait has lasted `--max-min` while the run is still going (printing or not). When both trip at once, 3 wins. Neither 3 nor 4 stops the run. |
 
 ## Being woken when a run ends
 
-An MCP server cannot wake an idle Claude session. `opencode_start` and `opencode_answer` return a `wait_command`; start it as a background shell command and the session is notified when it exits. Exit 3 means the log was silent for the stall time, which a long quiet command also causes: read the status before deciding the run stalled.
+An MCP server cannot wake an idle Claude session. `opencode_start` and `opencode_answer` return a `wait_command`; start it as a background shell command and the session is notified when it exits. Exit 3 means the log was silent for the stall time, which a long quiet command also causes: read the status before deciding the run stalled. Exit 4 means the run is still printing after `--max-min`: a run that loops while it logs (a test that never ends, printing as it goes) is never silent, so the stall check alone would not wake the caller. Read the log tail, then stop the run or wait again.
 
 ## How the rules reach OpenCode
 
