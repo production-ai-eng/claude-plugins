@@ -11,6 +11,7 @@
 //   node factory.mjs accept <session>              record a session as accepted, after its review, merge and tag
 //   node factory.mjs seal <session>                record the plan folder's contents before a builder turn
 //   node factory.mjs check-seal <session>          what changed in the plan folder since the seal
+//   node factory.mjs watch <output file> --stall-min <n> --done <file>   stall check for a long background command
 //   node factory.mjs show                          every setting, its value and its meaning
 //   node factory.mjs set <key> <value...>          for example: set builder.model provider/model
 //   node factory.mjs unset <key>                   clear a text or model setting
@@ -446,6 +447,40 @@ function cmdPrompt(o) {
       `opencode_start id=${run} dir="${values.WORKTREE}" prompt_file="${out}" model="${cfg.builder?.model || ''}" config="${rules}"`,
     ].filter(Boolean),
   };
+}
+
+// ---- watch: a stall check for a plain long command (the sweep, the full mutation run), as the bridge's
+// wait is for a builder run. Run it in the background beside the command, whose output goes to <file> and
+// which writes <done> when it ends. Exits 0 when <done> exists, 3 when <file> has not changed (size or
+// time) for --stall-min minutes. It reads two files and kills nothing; it needs no plan folder.
+function cmdWatch(o) {
+  const file = o._[0];
+  if (!file) fail('pass the output file to watch: watch <file> --stall-min <n> --done <file>');
+  const stallMin = Number(o.stallMin);
+  if (!(stallMin > 0 && stallMin <= 1440)) fail('pass --stall-min <minutes>, more than 0 and at most 1440');
+  if (!o.done) fail('pass --done <file>: the file the command writes when it ends (for example its exit code)');
+  const out = path.resolve(file);
+  const done = path.resolve(o.done);
+  const limit = stallMin * 60000;
+  const poll = Math.min(5000, Math.max(200, limit / 4));
+  const look = () => { try { const st = fs.statSync(out); return `${st.size}:${st.mtimeMs}`; } catch { return 'absent'; } };
+  let last = look();
+  let since = Date.now();
+  const started = since;
+  for (;;) {
+    if (fs.existsSync(done)) {
+      // A done file is created before it is written: give its writer a moment, then read it.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      return { ok: true, ended: true, note: 'the run ended; this says nothing of its result: read done_says (its exit code) and its output', done_file: done, done_says: (readOr(done, '') || '').trim().slice(0, 200), minutes: +((Date.now() - started) / 60000).toFixed(1) };
+    }
+    const now = look();
+    if (now !== last) { last = now; since = Date.now(); }
+    else if (Date.now() - since >= limit) {
+      return { ok: false, exit_code: 3, stalled: true, file: out, quiet_minutes: +((Date.now() - since) / 60000).toFixed(1),
+        meaning: 'the output has not changed for the stall limit. With a tool that prints a line per change and a limit well above its per-change time limit, silence usually means one test hangs; with a tool that prints only at the end, it means nothing. Find the test process that is oldest and stop it (the tool should then count that change as killed, timed out), or stop the run. Do not read a result from a run you stopped: clear its leftovers and run it again.' };
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, poll);
+  }
 }
 
 // ---- findings: the prompt for a builder answering review N, started as a fresh run in the same worktree.
@@ -960,7 +995,7 @@ function cmdDoctor(o) {
 
 const cmds = {
   init: cmdInit, doctor: cmdDoctor, trust: cmdTrust, where: cmdWhere, prompt: cmdPrompt, findings: cmdFindings,
-  'check-handback': cmdCheckHandback,
+  'check-handback': cmdCheckHandback, watch: cmdWatch,
   accept: cmdAccept, seal: cmdSeal, 'check-seal': cmdCheckSeal, show: cmdShow, set: cmdSet, unset: cmdUnset,
   add: (o) => cmdList(o, true), remove: (o) => cmdList(o, false),
 };
@@ -973,7 +1008,7 @@ try {
   if (argv[0] === '--plan') { planOpt = argv[1]; argv.splice(0, 2); }
   const [name, ...rest] = argv;
   if (!cmds[name]) {
-    console.log('usage: factory.mjs [--plan <dir>] init | doctor [--stage build] | trust [--yes] | where | prompt <session> --notes-file <f> | findings <session> --round <n> --findings-file <f> | check-handback <session> | accept <session> | seal <session> | check-seal <session> | show | set <key> <value> | unset <key> | add <key> <item> | remove <key> <item>');
+    console.log('usage: factory.mjs [--plan <dir>] init | doctor [--stage build] | trust [--yes] | where | prompt <session> --notes-file <f> | findings <session> --round <n> --findings-file <f> | check-handback <session> | watch <file> --stall-min <n> --done <file> | accept <session> | seal <session> | check-seal <session> | show | set <key> <value> | unset <key> | add <key> <item> | remove <key> <item>');
     process.exit(2);
   }
   let o;
@@ -984,7 +1019,7 @@ try {
   if (planOpt && !o.plan) o.plan = planOpt;
   const out = cmds[name](o);
   console.log(JSON.stringify(out, null, 2));
-  process.exit(out.ok === false ? 1 : 0);
+  process.exit(Number.isInteger(out.exit_code) ? out.exit_code : out.ok === false ? 1 : 0);
 } catch (e) {
   if (e instanceof Fail) { console.error('factory: ' + e.message); process.exit(2); }
   throw e;

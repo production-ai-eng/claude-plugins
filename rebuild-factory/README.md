@@ -37,8 +37,12 @@ The capable model plans, rules and reviews. A cheaper model builds. The owner de
 - **Agents**: `audit-reviewer`, `finding-verifier`, `plan-reviewer`, `session-reviewer`, `read-list-drafter`.
 - **References**: the method, read by the skills when needed: `layout.md`, `plan-standard.md`, `verification-standard.md`, `review-protocol.md`, `conductor-loop.md`.
 - **Templates**: the config, the builder's session prompt, the findings prompt, the spike block, the one-page handback, the review, the progress log.
-- **`scripts/factory.mjs`**: `init`, `doctor` (is this machine and project ready), `trust` (accept a plan folder on this machine), `where`, `prompt` and `findings` (fill the builder's prompt for a session or a findings round, refusing one that holds a control character), `check-handback`, `seal` and `check-seal` (did the plan folder change during a builder turn), and the settings commands `show`, `set`, `unset`, `add`, `remove`. Node 20 or later, no dependencies.
+- **`scripts/factory.mjs`**: `init`, `doctor` (is this machine and project ready), `trust` (accept a plan folder on this machine), `where`, `prompt` and `findings` (fill the builder's prompt for a session or a findings round, refusing one that holds a control character), `check-handback`, `watch` (a stall check for a long background command: wakes the conductor when its output stops changing), `seal` and `check-seal` (did the plan folder change during a builder turn), and the settings commands `show`, `set`, `unset`, `add`, `remove`. Node 20 or later, no dependencies.
 - **`bridge/`**: `oc-bridge`, an MCP server (and command line) that starts, continues, watches and stops non-interactive OpenCode runs. Registered by the plugin's `.mcp.json`.
+
+## What changed in 0.3.1
+
+- **Long runs are guarded against a hang.** A planted change that makes a test loop forever used to stop a sweep for hours with nothing to wake the conductor. The sweep and mutation tools a plan asks for now time out each change and count it as killed (`timed out`); the conductor runs a watchdog for single test processes and `factory.mjs watch` beside every long run, which exits when the output stops changing (the tools print a line per change, so a quiet output means a hang).
 
 ## What changed in 0.3.0
 
