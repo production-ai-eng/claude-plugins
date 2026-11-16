@@ -10,7 +10,7 @@ Verdict: <accepted | not accepted, findings sent back (failed review n of limit)
 
 ## Conductor's checks at the tip
 
-At `<commit>`, run by the conductor before the review: the phase command (exit code, tests passed), the full mutation run (killed of total), the line sweep (changes, killed, survived, skipped; since which commit).
+At `<commit>`, run by the conductor before the review: the phase command (exit code, tests passed), the full mutation run (killed of total), the line sweep (changes, killed, of them timed out, survived, skipped; since which commit).
 
 ## Reproduced
 

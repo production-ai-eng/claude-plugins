@@ -461,6 +461,32 @@ const db = J(fac(repo, 'doctor', '--stage', 'build'));
 ok('M3 a dirty main checkout fails the build-stage check', db.checks.find((c) => c.name === 'working tree').state === 'fail');
 ok('doctor creates nothing under the bridge home', !fs.existsSync(path.join(T, 'never')));
 
+// 0.3.1: watch, the stall check for a plain long command (a sweep that hangs on one change)
+const wdir = path.join(T, 'watch'); fs.mkdirSync(wdir);
+const wlog = path.join(wdir, 'sweep.log'), wdone = path.join(wdir, 'sweep.exit');
+fs.writeFileSync(wlog, 'change 1 killed\n');
+let t0 = Date.now();
+r = sh(F, ['watch', wlog, '--stall-min', '0.02', '--done', wdone], { cwd: T });
+ok('watch exits 3 when the output stops changing', r.code === 3 && J(r).stalled === true && Date.now() - t0 >= 1000, r.out);
+fs.writeFileSync(wdone, '0\n');
+r = sh(F, ['watch', wlog, '--stall-min', '0.02', '--done', wdone], { cwd: T });
+ok('watch exits 0 at once when the command has ended', r.code === 0 && J(r).ended === true && J(r).done_says === '0', r.out);
+fs.rmSync(wdone);
+{
+  // output that keeps growing past the stall limit is not a stall; the done file then ends the watch
+  const child = spawn(process.execPath, [F, 'watch', wlog, '--stall-min', '0.05', '--done', wdone], { cwd: T, env: ENV, stdio: ['ignore', 'pipe', 'pipe'] });
+  let code = null; child.on('exit', (c) => { code = c; });
+  for (let i = 0; i < 12; i++) { await sleep(400); fs.appendFileSync(wlog, `change ${i + 2} killed\n`); }
+  ok('watch does not fire while the output keeps changing', code === null);
+  fs.writeFileSync(wdone, '0\n');
+  for (let i = 0; i < 50 && code === null; i++) await sleep(100);
+  ok('watch then ends with the command', code === 0, String(code));
+}
+for (const args of [[wlog, '--done', wdone], [wlog, '--stall-min', '0', '--done', wdone], [wlog, '--stall-min', '5']]) {
+  r = sh(F, ['watch', ...args], { cwd: T });
+  ok(`watch refuses incomplete arguments (${args.slice(1).join(' ')})`, r.code === 2, r.out);
+}
+
 try { fs.rmSync(T, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 }); } catch { /* a temp folder left behind is harmless */ }
 console.log(`\n${pass} of ${pass + failed.length} passed` + (failed.length ? '\nFAILED:\n  ' + failed.join('\n  ') : ''));
 process.exit(failed.length ? 1 : 0);

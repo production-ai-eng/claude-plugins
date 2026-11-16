@@ -41,6 +41,8 @@ The plan lists the mutations per session, each chosen for a defect that matters:
 
 - **A patch runs the one test file that must catch it**, not the whole layer, and the tool checks that this file passes before the patch is applied. The tool honours that line as written; replacing it by the phase command made each mutation cost two full runs.
 - **Every session runs every earlier mutation too** (the full run), because a later change can revive an old defect. That list only grows, so the full run is the conductor's, at the tip under review; the builder runs only the patches whose lines it moved or changed (a single-patch mode).
+- **Each change prints a line as it finishes** (its result, flushed at once, not held in a buffer), so that a stall check on the output can tell a slow run from a hung one.
+- **Each change has a time limit.** The tool stops a change's test run after a set limit (minutes, well above the slowest normal run) and counts the change as killed, with the reason `timed out` recorded beside it. A defect that makes a test hang is caught: a hang is a failing test. Without the limit, one such change stops the whole run, and every session waits on it.
 - **The tool clears its own scratch state at start**: leftover processes and scratch copies of an interrupted run make every mutation report "baseline did not pass" within seconds. That message, that fast, means leftovers, not a failing test.
 
 ## The line sweep
@@ -49,6 +51,7 @@ The mutation list is what the plan's authors thought of. The line sweep is what 
 
 - **Build it in the first build session**, with its own self-test, so that every later session is swept from the start. Added after several sessions, it meets all of their survivors at once.
 - It takes a commit to sweep from (only lines changed since then), so that a re-review sweeps only the new lines.
+- It gives each change a time limit, as the mutation tool does: a removed or flipped condition can make a loop run forever, and a timed-out change counts as killed, with `timed out` recorded as its reason.
 - It sweeps numeric literals too, including those written with digit separators (`86_400`): a sweep that only knows plain digits never touches a limit written that way.
 - It is long (hours on a large session), so it is the conductor's to run, at the tip under review, never the builder's. The builder receives the survivors and, for each, kills it with a test or explains it with the smallest setup it tried. An explanation is a claim the reviewer tries to disprove.
 
