@@ -12,13 +12,20 @@
 //   budget lower <key> <n>                 (from the next run; the open run's budgets: owner budget)
 // The run (every write needs --lease <session>):
 //   run open <run> --integration <branch> --session <id> [--base <ref>]      (owner)
+//            [--delegate in-spec,copy,defaults]   decision classes the conductor settles without the owner
+//            [--plan <plan.json> [--plan-sha <sha>]]  budgets, delegation and every stream added and
+//            confirmed with this one yes (run plan <plan.json> shows a plan and its sha; read only)
 //   run close | lease take --session <id> [--force] | lease show
-//   stream add <s> --title <t> --tier low|high --ship on|off|research
+//   stream add <s> --title <t> --tier low|high --ship on|off|research [--after <s>]...
+//            --after: the stream waits until <s> is merged; its branch is then cut from the integration head
 //   brief record <s> --file <brief.md>
 //   dispatch <s|integration> --role <role> [--model m] [--target <commit>] [--on integration]
 //            [--dir <worktree>] [--prompt-file <f>] [--expect <file>]
 //            A worker on OpenCode is STARTED here, through the bundled bridge, with the trusted rules,
 //            the provider cap and the scrub list; the dispatch prints the wait command.
+//            A brief_writer or research dispatch with --dir reads a relative --expect (and the result's
+//            --file) from that worktree.
+//   teardown [--files] | teardown --yes [--files] [--list-sha <sha>]   show, then remove (owner), what the run set up
 //   result <dispatch> [--outcome ...] [--head c] [--file f] [--model-ran m]
 //            Worker outcomes are read from the bridge and git; test results from the test run.
 //   test start <dispatch> | test wait <dispatch> (or --state <file>) [--stall-min <n>]
@@ -27,7 +34,7 @@
 //   deploy record <unit> --result ok|failed [--rolled-back] [--verified ok|failed|skipped]
 //   carry add <s> --kind <k> --text <t>  |  carry clear <id> --why <w>  |  carry list
 //   owner confirm <s> --tier <t> --ship <m> | owner answer|waive|switch-on|ci-compose|merge-without ...
-//   owner budget <key> <n> --why <reason>                                  (owner records)
+//   owner budget <key> <n> --why <reason> | owner ack-delegated --count <n>  (owner records)
 // Reading:
 //   status [--json] | release-check | finish-check | reconcile | strays | verify
 // Hooks (read the event on stdin):
@@ -72,6 +79,13 @@ const RED_TEAM_ROLES = new Set(['stream_red_team', 'pre_merge_red_team']);
 const ROLES = ['brief_writer', 'worker', 'worker_escalation', 'round_reviewer', 'stream_red_team', 'pre_merge_red_team', 'research'];
 const OUTCOMES = new Set(['done', 'no_commit', 'rate_limited', 'quota', 'auth', 'died', 'stalled', 'stopped', 'failed']);
 const VERDICT_RE = /^verdict:\s*(MERGEABLE|CHANGES NEEDED)\s*$/;
+// The kinds of brief decision. The owner may delegate in-spec, copy and defaults at run open; "other" is
+// never delegated. A decision says its class as "class: <name>" in its marker.
+const DECISION_CLASSES = ['in-spec', 'copy', 'defaults', 'other'];
+const DELEGABLE = DECISION_CLASSES.filter((x) => x !== 'other');
+// The class is read from the marker only, "(changes what is built: yes; class: <name>)", never from the
+// decision's own words: text that mentions "class: copy" does not delegate a decision marked other.
+const decisionClass = (d) => { const m = String(d).match(/\(\s*changes what is built:\s*yes\s*;\s*class:\s*([A-Za-z][\w-]*)\s*\)\s*$/i); return m ? m[1].toLowerCase() : null; };
 const TOKEN_TTL_MS = 15 * 60_000;
 // A token older than this is removed by the next guarded tool call (purgeTokens runs only inside a
 // hook call). With no guarded call in between, a token stays usable until TOKEN_TTL_MS.
@@ -212,19 +226,23 @@ function readLineSync() {
 
 const shownArgs = () => process.argv.slice(2).map((a) => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a)).join(' ');
 let OWNER_PROVEN = false;
-function ownerProof() {
-  if (ownerModeHere() === 'deny') {
-    if (!process.stdin.isTTY) fail(`this is an owner record and this project's hook_mode is deny: it is accepted only from the owner's own terminal, where the helper asks him to type yes. A chat's shell (and a command typed with !) has no terminal. The owner runs, in his own terminal, in the repository: node "${SELF}" ${shownArgs()}`);
-    process.stderr.write(`change-factory: owner record\n  folder: ${process.cwd()}\n  record: ${shownArgs()}\nType yes to record it, anything else to refuse: `);
-    if (readLineSync() !== 'yes') fail('not recorded: the owner did not type yes');
-  } else useToken();
+// makePreview builds what the owner is shown before typing yes. In ask mode the token is used up first, so a
+// preview that fails (an untrusted config, a bad plan) cannot leave it behind for an unprompted retry.
+function ownerProof(makePreview = () => '') {
+  if (ownerModeHere() !== 'deny') { useToken(); makePreview(); OWNER_PROVEN = true; return; }
+  if (!process.stdin.isTTY) fail(`this is an owner record and this project's hook_mode is deny: it is accepted only from the owner's own terminal, where the helper asks him to type yes. A chat's shell (and a command typed with !) has no terminal. The owner runs, in his own terminal, in the repository: node "${SELF}" ${shownArgs()}`);
+  // Control characters (a terminal escape in a title or a commit subject) could redraw what the owner reads.
+  const preview = String(makePreview() || '').replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '?');
+  process.stderr.write(`change-factory: owner record\n  folder: ${process.cwd()}\n  record: ${shownArgs()}\n${preview ? preview + '\n' : ''}Type yes to record it, anything else to refuse: `);
+  if (readLineSync() !== 'yes') fail('not recorded: the owner did not type yes');
   OWNER_PROVEN = true;
 }
 const needOwner = () => { if (!OWNER_PROVEN) fail('this is an owner record; it needs the owner\'s yes (the hook\'s prompt, or in hook_mode deny the owner\'s own terminal)'); };
 function isOwnerCommand(args) {
   const a = normArgs(args);
   return /^owner\s+\S/.test(a) || (/^trust\b/.test(a) && /(^|\s)--yes\b/.test(a)) || /^run\s+open\b/.test(a)
-    || /^role\s+set\s+(stream_red_team|pre_merge_red_team)\s+(model|fallback|on_fallback)\b/.test(a);
+    || /^role\s+set\s+(stream_red_team|pre_merge_red_team)\s+(model|fallback|on_fallback)\b/.test(a)
+    || (/^teardown\b/.test(a) && /(^|\s)--yes\b/.test(a));
 }
 
 // ---------- the project and its config
@@ -389,26 +407,34 @@ function carryItems(repo) {
 function fold(events) {
   const st = { run: null, base: null, integration: null, lease: null, budgets: {}, streams: {}, dispatches: {}, order: [],
     merges: [], commits: [], regens: [], compose: [], deploys: {}, mergeWithout: {}, canary: {}, lastWrite: null,
-    counts: { worker: 0, ci: 0, red_team: 0 }, ireviews: [], itests: {}, ciRuns: {}, testRuns: {} };
+    counts: { worker: 0, ci: 0, red_team: 0 }, ireviews: [], itests: {}, ciRuns: {}, testRuns: {}, delegate: [], delegatedSeq: 0, ackedUpTo: 0 };
   const S = (n) => st.streams[n];
   for (const e of events) {
     if (e._bad) continue;
     st.lastWrite = e.at;
     switch (e.type) {
-      case 'run.open': Object.assign(st, { run: e.run, base: e.base, integration: e.integration, budgets: e.budgets || {}, lease: e.session }); break;
+      case 'run.open': Object.assign(st, { run: e.run, base: e.base, integration: e.integration, budgets: e.budgets || {}, lease: e.session, delegate: e.delegate || [] }); break;
+      case 'owner.ack_delegated': st.ackedUpTo = Math.max(st.ackedUpTo, e.upto); break;
       case 'lease': st.lease = e.session; break;
       case 'stream.add': st.streams[e.stream] = { name: e.stream, title: e.title, tier: e.tier, ship: e.ship, confirmed: false, brief: null,
         needs: [], rounds: 0, failed: 0, heads: [], fixes: [], reviews: [], tests: {}, merged: null, remerges: [], eligible: [], authors: new Set(), reviewers: new Set(),
-        owed: [], waived: [], switchedOn: false, lane: null, branch: null }; st.order.push(e.stream); break;
+        owed: [], waived: [], switchedOn: false, lane: null, branch: null, after: e.after || [], cut: null, delegated: [] }; st.order.push(e.stream); break;
       case 'owner.confirm': S(e.stream).confirmed = true; break;
       case 'brief': {
         const s = S(e.stream); s.brief = e;
         // A later brief can add what waits for the owner, never remove it: only the owner's answer clears it.
         const needs = [];
         if (e.premise === 'changed') needs.push('the premise changed');
-        // A decision stops the stream unless the brief marks it as not changing what is built.
-        const stopping = (e.decisions || []).filter((d) => !/changes what is built:\s*no\b/i.test(d));
-        if (stopping.length) needs.push(`${stopping.length} decision(s) the brief writer made that change what is built (or are not marked)`);
+        // A decision stops the stream unless the brief marks it as not changing what is built, or it is of
+        // a class the owner delegated at run open: that one is listed for the owner and does not stop it.
+        const changing = (e.decisions || []).filter((d) => !/changes what is built:\s*no\b/i.test(d));
+        const stopping = changing.filter((d) => !st.delegate.includes(decisionClass(d)));
+        for (const d of changing.filter((x) => !stopping.includes(x))) {
+          if (s.delegated.some((x) => x.text === d)) continue;
+          st.delegatedSeq++;
+          s.delegated.push({ n: st.delegatedSeq, text: d, class: decisionClass(d), at: e.at });
+        }
+        if (stopping.length) needs.push(`${stopping.length} decision(s) the brief writer made that change what is built (or are not marked)${st.delegate.length ? ', in no delegated class' : ''}`);
         if (e.questions.length) needs.push(`${e.questions.length} question(s) for the owner`);
         s.needs = [...new Set([...s.needs, ...needs])];
         break;
@@ -420,7 +446,7 @@ function fold(events) {
         if (WORKER_ROLES.has(e.role)) st.counts.worker++;
         if (e.role === 'ci') st.counts.ci++;
         if (RED_TEAM_ROLES.has(e.role)) st.counts.red_team++;
-        if (WORKER_ROLES.has(e.role) && e.on === 'stream' && e.branch && S(e.stream) && !S(e.stream).branch) S(e.stream).branch = e.branch;
+        if (WORKER_ROLES.has(e.role) && e.on === 'stream' && e.branch && S(e.stream) && !S(e.stream).branch) { S(e.stream).branch = e.branch; if (e.cut) S(e.stream).cut = e.cut; }
         if (e.owed && S(e.stream)) S(e.stream).owed.push({ id: e.id, role: e.role, wanted: e.wanted, ran: e.model, cleared: false });
         break;
       }
@@ -557,6 +583,38 @@ function codeHead(c, ref) {
   return x;
 }
 
+// A stream added with --after waits until every stream it names has a recorded merge.
+const waitingOn = (c, s) => (s.after || []).filter((a) => !c.st.streams[a]?.merged);
+// Where a stream's own work starts: the run's base, or for a stream that waited, the integration commit
+// its branch was cut from. Its diffs, lane and review packs are read from there.
+const streamBase = (c, s) => s.cut || c.st.base;
+// A stream that waited is built on the merged code: its branch must start from an integration commit
+// that holds every merge it waited for. Returns that commit (null for a stream that waited for nothing).
+function needCut(c, s, wt) {
+  if (!(s.after || []).length) return null;
+  const ih = integrationHead(c);
+  const cut = git(c.repo, ['merge-base', wt.head, ih], { ok: true }) || fail(`${wt.branch} shares no history with ${c.st.integration}`);
+  for (const a of s.after) {
+    const m = c.st.streams[a].merged.commit;
+    if (!isAncestor(c.repo, m, cut)) fail(`stream ${s.name} waited for ${a}: its branch ${wt.branch} must start from ${c.st.integration} at or after ${a}'s merge ${short(m)}, and it does not. Cut it from the integration head: git -C "<repository>" worktree add -b <stream branch> "<worktree_root>/${s.name}" ${c.st.integration}`);
+  }
+  // Everything below the cut is left out of this stream's review, lane and test gate, so the cut must be a
+  // commit of the integration line in which every commit is accounted for (a merge, a recorded commit, a
+  // dispatched fix or record files): a commit of the conductor's own cannot be hidden under it.
+  if (!onIntegrationLine(c, cut, ih)) fail(`${short(cut)}, where ${wt.branch} leaves ${c.st.integration}, is not on the integration branch's own line (its first parents): cut the branch from the integration head`);
+  const loose = unaccounted(c, cut);
+  if (loose.length) fail(`below the cut ${short(cut)} the integration branch holds commits not accounted for: ${loose.map(short).join(', ')}. Record them, or remove them, before a stream is cut from there`);
+  return cut;
+}
+// A commit of the integration branch's first-parent line (the run's base counts).
+function onIntegrationLine(c, x, ih = revParse(c.repo, c.st.integration)) {
+  if (x === c.st.base) return true;
+  return !!ih && lines(git(c.repo, ['rev-list', '--first-parent', `${c.st.base}..${ih}`])).includes(x);
+}
+// The cut of a stream that waited must still be on the integration line: a reset of the integration branch
+// below it would take the commits it hid out of every gate.
+const cutProblem = (c, s) => (s.cut && !onIntegrationLine(c, s.cut) ? `stream ${s.name} was cut from ${short(s.cut)}, which is no longer on ${c.st.integration}'s line: the integration branch was moved under it` : null);
+
 const latestReview = (s, target) => [...s.reviews].reverse().find((r) => r.target === target && r.role === 'round_reviewer') || null;
 const latestIReview = (c, target) => [...c.st.ireviews].reverse().find((r) => r.target === target) || null;
 const streamHead = (s) => (s.heads.length ? s.heads[s.heads.length - 1].head : null);
@@ -568,8 +626,8 @@ const openDispatch = (c, stream, roles) => Object.values(c.st.dispatches).find((
 function streamGate(c, s, tip) {
   const code = codeHead(c, tip);
   const workerHeads = new Set(s.heads.map((h) => h.head));
-  const chain = lines(git(c.repo, ['rev-list', '--first-parent', `${c.st.base}..${code}`]));
-  const problems = []; const conductor = [];
+  const chain = lines(git(c.repo, ['rev-list', '--first-parent', `${streamBase(c, s)}..${code}`]));
+  const problems = [cutProblem(c, s)].filter(Boolean); const conductor = [];
   let worker = null;
   for (const x of chain) {
     if (workerHeads.has(x)) { worker = x; break; }
@@ -771,8 +829,106 @@ function cmdBudget(o) {
 
 // ---------- commands: the run
 
+const KNOWN_BUDGETS = ['max_rounds_per_stream', 'max_worker_runs', 'max_ci_runs', 'max_red_team_passes'];
+
+// --delegate in-spec,copy: the decision classes the conductor may settle in this run.
+function parseDelegate(v) {
+  if (v === undefined) return [];
+  const xs = String(v).split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  for (const x of xs) if (!DELEGABLE.includes(x)) fail(`--delegate takes ${DELEGABLE.join(', ')} (comma-separated); "${x}" is not one${x === 'other' ? ': "other" is never delegated' : ''}`);
+  return [...new Set(xs)];
+}
+
+// A run plan: the budgets, the delegated classes and every stream, opened and confirmed with one owner
+// yes. Read and checked in full before the owner is asked; its hash binds the yes to what was shown.
+function readPlan(cfg, file) {
+  const text = readOr(file) ?? fail(`plan file not found: ${file}`);
+  let p;
+  try { p = JSON.parse(text); } catch (e) { fail(`the plan ${file} is not valid JSON: ${e.message}`); }
+  if (!p || typeof p !== 'object' || Array.isArray(p)) fail('the plan is a JSON object: { "budgets": {...}, "delegate": [...], "streams": [...] }');
+  for (const k of Object.keys(p)) if (!['budgets', 'delegate', 'streams'].includes(k)) fail(`the plan has an unknown key "${k}" (budgets, delegate, streams)`);
+  const known = new Set([...KNOWN_BUDGETS, ...Object.keys(cfg.budgets || {})]);
+  const budgets = p.budgets ?? {};
+  if (typeof budgets !== 'object' || Array.isArray(budgets)) fail('the plan\'s budgets is an object of budget: number');
+  for (const [k, v] of Object.entries(budgets)) {
+    if (!known.has(k)) fail(`the plan's budget "${k}" is not a budget (${[...known].join(', ')})`);
+    if (!Number.isInteger(v) || v < 1) fail(`the plan's budget ${k} must be a whole number, 1 or more`);
+  }
+  if (p.delegate !== undefined && !Array.isArray(p.delegate)) fail('the plan\'s delegate is a list of decision classes');
+  const delegate = parseDelegate(p.delegate === undefined ? undefined : p.delegate.join(','));
+  if (!Array.isArray(p.streams) || !p.streams.length) fail('the plan lists its streams: [{ "name", "title", "tier", "ship", "after": [] }]');
+  const seen = {};
+  const streams = p.streams.map((x) => {
+    if (!x || typeof x !== 'object' || Array.isArray(x)) fail('each stream in the plan is an object');
+    for (const k of Object.keys(x)) if (!['name', 'title', 'tier', 'ship', 'after'].includes(k)) fail(`stream ${x.name}: unknown key "${k}" (name, title, tier, ship, after)`);
+    const s = { name: x.name, title: x.title ?? x.name, tier: x.tier, ship: x.ship, after: x.after ?? [] };
+    checkStream(cfg, seen, s);
+    seen[s.name] = s;
+    return s;
+  });
+  const merged = { ...(cfg.budgets || {}), ...budgets };
+  const summary = [
+    `run plan ${path.resolve(file)} (plan sha ${sha(text).slice(0, 12)})`,
+    `  budgets for this run: ${Object.entries(merged).map(([k, v]) => `${k} ${v}${budgets[k] !== undefined && budgets[k] !== cfg.budgets?.[k] ? ` (config ${cfg.budgets?.[k] ?? 'none'})` : ''}`).join(', ') || 'none'}`,
+    `  delegated decision classes: ${delegate.length ? delegate.join(', ') + ' (the conductor settles these without you; each is listed in status, and release waits for your owner ack-delegated)' : 'none (every decision that changes what is built waits for you)'}`,
+    `  streams, each confirmed with this yes:`,
+    ...streams.map((s) => `    ${s.name}  tier ${s.tier}, ship ${s.ship}${s.after.length ? `, waits for ${s.after.join(', ')}` : ''}  - ${s.title}`),
+  ].join('\n');
+  return { budgets, merged, delegate, streams, sha: sha(text).slice(0, 12), summary };
+}
+
+// What the owner is shown at the terminal before typing yes (hook_mode deny), and what the record is
+// checked against once it holds the lock: a plan file changed, or a teardown list that changed, after it was
+// shown is refused.
+let SHOWN = null;
+function previewFor(name, o) {
+  if (name === 'run' && o._[0] === 'open') {
+    const { cfg } = load();
+    const lines = [];
+    if (o.plan) {
+      if (o.delegate !== undefined) fail('give the delegated classes in the plan or with --delegate, not both');
+      const p = readPlan(cfg, o.plan);
+      if (o['plan-sha'] !== undefined && o['plan-sha'] !== p.sha) fail(`--plan-sha ${o['plan-sha']} is not the plan's (${p.sha}): the plan changed since it was shown. Show it again (run plan ${o.plan}).`);
+      if (ownerModeHere() !== 'deny' && o['plan-sha'] === undefined) fail(`with hook_mode ask the prompt shows only the command, not the plan: show the owner the plan (run plan ${o.plan}) and add --plan-sha ${p.sha} to the command, so the yes is bound to that plan`);
+      lines.push(p.summary);
+      SHOWN = { plan: p.sha };
+    } else {
+      const d = parseDelegate(o.delegate);
+      if (d.length) lines.push(`  delegated decision classes: ${d.join(', ')} (the conductor settles these without you; each is listed in status, and release waits for your owner ack-delegated)`);
+    }
+    return lines.join('\n');
+  }
+  if (name === 'teardown' && o.yes) {
+    const t = teardownView(o);
+    // Ask mode: the prompt shows only the command, so the list the conductor showed is named by its hash in
+    // it, and what would be removed now must still hash to that. Deny mode: the terminal shows the list.
+    if (ownerModeHere() !== 'deny') {
+      if (o['list-sha'] === undefined) fail(`with hook_mode ask the prompt shows only the command, not the list: show the owner the list (teardown${o.files ? ' --files' : ''}) and add --list-sha ${t.key} to the command`);
+      SHOWN = { teardown: o['list-sha'] };
+    } else {
+      // Deny mode: what counts is the list this terminal shows now; a --list-sha given must name that list.
+      if (o['list-sha'] !== undefined && o['list-sha'] !== t.key) fail(`--list-sha ${o['list-sha']} is not the list as it is now (${t.key}): it changed since it was shown. Show it again (teardown).`);
+      SHOWN = { teardown: t.key };
+    }
+    return t.text;
+  }
+  if (name === 'owner' && o._[0] === 'ack-delegated') {
+    // What the owner acknowledges, shown at his terminal (deny mode), not only its count.
+    const c = ctx();
+    const open = unackedDelegated(c);
+    return open.length ? ['  delegated decisions acknowledged by this record:', ...open.map((x) => `    [${x.stream}] ${x.text}`)].join('\n') : '';
+  }
+  return '';
+}
+
 function cmdRun(o) {
   const [verb, run] = o._;
+  if (verb === 'plan') {
+    const { cfg } = load();
+    const p = readPlan(cfg, run || fail('usage: run plan <plan.json>'));
+    return { plan_sha: p.sha, budgets: p.merged, delegate: p.delegate, streams: p.streams, shown_to_owner: p.summary,
+      next: `show the owner every line of shown_to_owner. Then the owner opens the run with it: run open <run> --integration <branch> --session <id> --plan ${run}${ownerModeHere() === 'deny' ? ' (in his own terminal, where the plan is shown again before his yes)' : ` --plan-sha ${p.sha}`}` };
+  }
   if (verb === 'open') {
     needOwner();
     const c = ctx({ needRun: false });
@@ -782,9 +938,23 @@ function cmdRun(o) {
     if (!o.session) fail('--session <id> is required: the conductor that will hold the lease');
     if (fs.existsSync(runLog(c.repo, run))) fail(`a run named ${run} already exists in this project`);
     const base = revParse(c.repo, o.base || c.cfg.main_branch) || fail(`cannot read ${o.base || c.cfg.main_branch}`);
+    let plan = null;
+    if (o.plan) {
+      plan = readPlan(c.cfg, o.plan);
+      if (!SHOWN || SHOWN.plan !== plan.sha) fail('the plan file changed after it was shown to the owner: nothing recorded. Show it again and open the run again.');
+    }
+    const delegate = plan ? plan.delegate : parseDelegate(o.delegate);
+    const budgets = plan ? plan.merged : (c.cfg.budgets || {});
     appendTo(projectLog(c.repo), 'run.open', { run }, o.session);
-    appendTo(runLog(c.repo, run), 'run.open', { run, base, main_branch: c.cfg.main_branch, integration: o.integration, budgets: c.cfg.budgets || {}, session: o.session, conductor_model: c.cfg.conductor_model }, o.session);
-    return { run, base, integration: o.integration, lease: o.session, budgets: c.cfg.budgets || {}, carry_open: carryItems(c.repo) };
+    const log = runLog(c.repo, run);
+    appendTo(log, 'run.open', { run, base, main_branch: c.cfg.main_branch, integration: o.integration, budgets, session: o.session, conductor_model: c.cfg.conductor_model, ...(delegate.length ? { delegate } : {}), ...(plan ? { plan_sha: plan.sha } : {}) }, o.session);
+    // One owner yes, every event still stamped and chained: each stream is added and confirmed as the
+    // individual commands would record it.
+    for (const s of plan?.streams || []) {
+      appendTo(log, 'stream.add', { stream: s.name, title: s.title, tier: s.tier, ship: s.ship, ...(s.after.length ? { after: s.after } : {}), plan: plan.sha }, o.session);
+      appendTo(log, 'owner.confirm', { stream: s.name, tier: s.tier, ship: s.ship, plan: plan.sha }, o.session);
+    }
+    return { run, base, integration: o.integration, lease: o.session, budgets, delegate, streams: plan ? plan.streams.map((s) => s.name) : undefined, carry_open: carryItems(c.repo) };
   }
   if (verb === 'close') {
     const c = ctx(); needLease(c, o.lease);
@@ -792,7 +962,7 @@ function cmdRun(o) {
     appendTo(projectLog(c.repo), 'run.close', { run: c.run }, o.lease);
     return { closed: c.run, carry_open: carryItems(c.repo) };
   }
-  fail('usage: run open <run> --integration <branch> --session <id> | run close --lease <id>');
+  fail('usage: run open <run> --integration <branch> --session <id> [--delegate <classes>] [--plan <plan.json> [--plan-sha <sha>]] | run plan <plan.json> | run close --lease <id>');
 }
 
 function cmdLease(o) {
@@ -805,17 +975,31 @@ function cmdLease(o) {
   return { lease: o.session, taken_from: c.st.lease, note: 'a lease stops two conductors by accident; it is not a password' };
 }
 
+// One stream's definition, checked against the streams added before it (stream add, and each stream of a
+// run plan). A stream waits only for streams added before it, so a cycle cannot be written.
+function checkStream(cfg, streams, { name, title, tier, ship, after = [] }) {
+  if (!NAME_RE.test(name || '') || name === 'integration') fail(`stream "${name}": a stream name is letters, digits, _ and -, at most 24, and not "integration"`);
+  if (Object.hasOwn(streams, name)) fail(`stream ${name} exists`);
+  if (title !== undefined && (typeof title !== 'string' || /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/.test(title) || title.length > 120)) fail(`stream ${name}: the title is one line of at most 120 characters, with no control characters`);
+  if (!['low', 'high'].includes(tier)) fail(`stream ${name}: the tier is low or high`);
+  const ships = cfg.flags ? ['on', 'off', 'research'] : ['on', 'research'];
+  if (!ships.includes(ship)) fail(`stream ${name}: the ship mode is ${ships.join(', ')}${cfg.flags ? '' : ' (this project has no flags: set "flags": true for off)'}`);
+  if (!Array.isArray(after) || new Set(after).size !== after.length) fail(`stream ${name}: --after names each stream once`);
+  for (const a of after) {
+    const x = (Object.hasOwn(streams, a) && streams[a]) || fail(`stream ${name} --after ${a}: no stream ${a} yet (a stream waits only for one added before it)`);
+    if (x.ship === 'research') fail(`stream ${name} --after ${a}: a research stream is never merged, so nothing can wait for it`);
+  }
+}
+
 function cmdStream(o) {
   const c = ctx(); needLease(c, o.lease);
   const [verb, name] = o._;
-  if (verb !== 'add') fail('usage: stream add <s> --title <t> --tier low|high --ship on|off|research');
-  if (!NAME_RE.test(name || '') || name === 'integration') fail('a stream name is letters, digits, _ and -, at most 24, and not "integration"');
-  if (c.st.streams[name]) fail(`stream ${name} exists`);
-  if (!['low', 'high'].includes(o.tier)) fail('--tier is low or high');
-  const ships = c.cfg.flags ? ['on', 'off', 'research'] : ['on', 'research'];
-  if (!ships.includes(o.ship)) fail(`--ship is ${ships.join(', ')}${c.cfg.flags ? '' : ' (this project has no flags: set "flags": true for off)'}`);
-  record(c, 'stream.add', { stream: name, title: o.title || name, tier: o.tier, ship: o.ship }, o.lease);
-  return { stream: name, tier: o.tier, ship: o.ship, next: 'show the owner the tier and ship mode; record their yes with owner confirm' };
+  if (verb !== 'add') fail('usage: stream add <s> --title <t> --tier low|high --ship on|off|research [--after <s>]...');
+  const after = o.after || [];
+  checkStream(c.cfg, c.st.streams, { name, title: o.title, tier: o.tier, ship: o.ship, after });
+  record(c, 'stream.add', { stream: name, title: o.title || name, tier: o.tier, ship: o.ship, ...(after.length ? { after } : {}) }, o.lease);
+  return { stream: name, tier: o.tier, ship: o.ship, after: after.length ? after : undefined,
+    next: 'show the owner the tier and ship mode; record their yes with owner confirm' + (after.length ? `. It waits for ${after.join(', ')}: no brief or worker until that merge is recorded; then cut its branch from the integration head` : '') };
 }
 
 function section(text, title) {
@@ -829,6 +1013,8 @@ function cmdBrief(o) {
   const [verb, name] = o._;
   if (verb !== 'record') fail('usage: brief record <s> --file <brief.md>');
   const s = c.st.streams[name] || fail(`no stream ${name}`);
+  const wait = waitingOn(c, s);
+  if (wait.length) fail(`stream ${name} waits for ${wait.join(', ')} to merge: its brief is written when its turn comes, against the merged code`);
   const text = readOr(o.file) ?? fail(`brief file not found: ${o.file}`);
   const premise = section(text, 'Premise');
   if (premise === null) fail('the brief has no "## Premise" section (status: holds|changed, and evidence with a file:line)');
@@ -842,11 +1028,18 @@ function cmdBrief(o) {
     lists[k] = listItems(body);
   }
   if (!lists.owned.length) fail('the Owned paths section lists no paths');
+  for (const d of lists.decisions) {
+    const cls = decisionClass(d);
+    if (cls === null) continue;
+    if (!DECISION_CLASSES.includes(cls)) fail(`the decision "${d.slice(0, 80)}" has class "${cls}"; a class is one of ${DECISION_CLASSES.join(', ')}`);
+    if (cls === 'in-spec' && !/[\w./-]+\.[A-Za-z0-9]+:\d+/.test(d)) fail(`the decision "${d.slice(0, 80)}" is class in-spec: it must cite, as file:line, the spec, design or prototype that settles it`);
+  }
   const off = section(text, 'Off switch');
   if (s.ship !== 'research' && off === null) fail('the brief has no "## Off switch" section (how to turn this stream\'s change off, and every place it must be set)');
   const ev = record(c, 'brief', { stream: name, file: path.resolve(o.file), sha: sha(text), premise: status.toLowerCase(), ...lists, off_switch: off || '' }, o.lease);
   const after = fold([...c.events, ev]).streams[name];
-  return { stream: name, premise: status.toLowerCase(), needs_owner: after.needs.length > 0, needs: after.needs, could_not_verify: lists.unverified };
+  const delegated = after.delegated.filter((x) => !s.delegated.some((y) => y.text === x.text)).map((x) => `${x.class}: ${x.text}`);
+  return { stream: name, premise: status.toLowerCase(), needs_owner: after.needs.length > 0, needs: after.needs, delegated: delegated.length ? delegated : undefined, could_not_verify: lists.unverified };
 }
 
 function chooseModel(c, role, wanted) {
@@ -921,12 +1114,28 @@ function cmdDispatch(o) {
   const s = c.st.streams[name] || fail(`no stream ${name}`);
   if (!s.confirmed) fail(`stream ${name}: tier and ship mode are not confirmed by the owner (owner confirm ${name})`);
 
+  const wait = waitingOn(c, s);
+  if (wait.length) fail(`stream ${name} waits for ${wait.join(', ')} to merge (stream add --after): nothing is briefed or dispatched for it until the merge is recorded`);
+
   if (role === 'brief_writer' || role === 'research') {
     if (role === 'research' && s.ship !== 'research') fail(`stream ${name} is not a research stream`);
     const { model, isFallback, owedIfFallback } = chooseModel(c, role, o.model);
     Object.assign(ev, { model, via: c.cfg.roles[role].via, wanted: c.cfg.roles[role].model, owed: owedIfFallback && isFallback });
+    // The brief belongs on the stream branch, in its worktree: with --dir, a relative --expect (and the
+    // result's --file) is read from that worktree, not from the folder the helper runs in.
+    if (o.dir) {
+      const wt = worktreeInfo(c, o.dir);
+      if (role === 'brief_writer') {
+        if (wt.branch === c.st.integration || wt.branch === c.cfg.main_branch) fail(`a brief is written on the stream's own branch, not ${wt.branch}`);
+        if (s.branch && s.branch !== wt.branch) fail(`stream ${name} works on ${s.branch}; ${wt.dir} has ${wt.branch} checked out`);
+        if (Object.values(c.st.streams).some((x) => x.name !== name && x.branch === wt.branch)) fail(`${wt.branch} is another stream's branch`);
+        needCut(c, s, wt);
+      }
+      ev.dir = wt.dir;
+      if (o.expect) ev.expect = path.resolve(wt.dir, o.expect);
+    }
     record(c, 'dispatch', ev, o.lease);
-    return { dispatch: id, role, model, effort: c.cfg.roles[role].effort || null, expect: ev.expect, research_runner: role === 'research' ? (c.cfg.research_runner || '').replaceAll('{stream}', name) : undefined };
+    return { dispatch: id, role, model, effort: c.cfg.roles[role].effort || null, expect: ev.expect, dir: ev.dir || undefined, research_runner: role === 'research' ? (c.cfg.research_runner || '').replaceAll('{stream}', name) : undefined };
   }
 
   if (!s.brief) fail(`stream ${name} has no brief recorded`);
@@ -953,6 +1162,8 @@ function cmdDispatch(o) {
       if (wt.branch === c.st.integration || wt.branch === c.cfg.main_branch) fail(`a stream round runs on the stream's own branch, not ${wt.branch}`);
       if (s.branch && s.branch !== wt.branch) fail(`stream ${name} works on ${s.branch}; ${wt.dir} has ${wt.branch} checked out`);
       if (Object.values(c.st.streams).some((x) => x.name !== name && x.branch === wt.branch)) fail(`${wt.branch} is another stream's branch`);
+      // The first worker round binds the branch; a stream that waited must start from the merged code.
+      if (!s.branch) { const cut = needCut(c, s, wt); if (cut) ev.cut = cut; }
     }
     Object.assign(ev, { round, attempt, model, via, wanted: c.cfg.roles[role].model, owed: false, on: o.on || 'stream', dir: wt.dir, branch: wt.branch, start_head: wt.head, run_id: `${c.run}-${name}-r${round}-a${attempt}` });
     if (o.on === 'integration') ev.from = wt.head;
@@ -992,10 +1203,10 @@ function cmdDispatch(o) {
 
   if (role === 'round_reviewer') {
     const conductorCommits = c.st.commits.filter((k) => k.stream === name && k.kind === 'test_only');
-    let target = o.target ? revParse(c.repo, o.target) : null, from = c.st.base, author = null;
+    let target = o.target ? revParse(c.repo, o.target) : null, from = streamBase(c, s), author = null;
     if (o.target && !target) fail(`${o.target} is not a commit`);
     if (!target) {
-      const pend = [...s.fixes.map((f) => ({ head: f.head, from: f.from, author: f.author })), ...s.heads.map((h) => ({ head: h.head, from: c.st.base, author: h.author })),
+      const pend = [...s.fixes.map((f) => ({ head: f.head, from: f.from, author: f.author })), ...s.heads.map((h) => ({ head: h.head, from: streamBase(c, s), author: h.author })),
         ...conductorCommits.map((k) => ({ head: k.commit, from: k.commit + '^1', author: c.cfg.conductor_model }))].filter((x) => !latestReview(s, x.head));
       if (!pend.length) fail(`stream ${name}: nothing waits for a review`);
       ({ head: target, from, author } = pend[pend.length - 1]);
@@ -1005,7 +1216,7 @@ function cmdDispatch(o) {
       if (!h && !k) fail(`${short(target)} is not a head a worker of ${name} produced, nor a recorded test_only commit of it`);
       const prev = latestReview(s, target);
       if (prev && !c.st.dispatches[prev.dispatch]?.owed) fail(`${short(target)} already has a verdict (${prev.verdict}); a head is reviewed once (again only to pay an owed pass). CHANGES NEEDED is answered by a new round`);
-      author = h ? h.author : c.cfg.conductor_model; from = h ? (h.from || c.st.base) : target + '^1';
+      author = h ? h.author : c.cfg.conductor_model; from = h ? (h.from || streamBase(c, s)) : target + '^1';
     }
     const { model, isFallback, owedIfFallback } = chooseModel(c, role, o.model);
     const owed = indep(c, role, model, [author], isFallback, owedIfFallback, `the model that wrote ${short(target)}`);
@@ -1029,7 +1240,7 @@ function cmdDispatch(o) {
       target = s.merged.commit; from = target + '^1'; extra = rt.later || [];
     } else {
       if (!(c.cfg.roles.pre_merge_red_team?.streams || []).includes(name)) fail(`stream ${name} is not named in roles.pre_merge_red_team.streams`);
-      target = streamHead(s) || fail(`stream ${name} has no head yet`); from = c.st.base;
+      target = streamHead(s) || fail(`stream ${name} has no head yet`); from = streamBase(c, s);
     }
     const ind = c.cfg.independence || {};
     const avoid = [...(ind.red_team_not_reviewer !== false ? s.reviewers : []), ...(ind.red_team_not_author !== false ? s.authors : [])];
@@ -1065,7 +1276,9 @@ function cmdResult(o) {
   const d = c.st.dispatches[id] || fail(`no dispatch ${id}`);
   if (d.result) fail(`dispatch ${id} already has a result`);
   if (o.outcome && !OUTCOMES.has(o.outcome)) fail(`--outcome is one of ${[...OUTCOMES].join(', ')}`);
-  if (d.expect && o.file && !samePath(o.file, d.expect)) fail(`--file ${o.file} is not the file this dispatch expects (${d.expect}); the agent was told to write that one`);
+  // A brief writer's or research dispatch made with --dir reads a relative --file from that worktree.
+  if (o.file && d.dir && !WORKER_ROLES.has(d.role)) o.file = path.resolve(d.dir, o.file);
+  if (d.expect && o.file && !samePath(o.file, d.expect)) fail(`--file ${path.resolve(o.file)} is not the file this dispatch expects (${d.expect}); the agent was told to write that one`);
   if (o['model-ran'] && o['model-ran'] !== d.model) fail(`the call ran on ${o['model-ran']}, not the dispatched ${d.model}: record a new dispatch with --model ${o['model-ran']} instead`);
   const ev = { dispatch: id };
   const out = { dispatch: id };
@@ -1269,11 +1482,11 @@ function mergeTree(repo, p1, p2) {
 // mostly line endings or whitespace.
 function laneOf(c, s, head) {
   const owned = (s.brief?.owned || []).map((g) => g.replace(/^`|`$/g, ''));
-  const files = lines(git(c.repo, ['diff', '--name-only', `${c.st.base}..${head}`])).filter((f) => !matchesAny(f, c.cfg.docs_paths));
+  const files = lines(git(c.repo, ['diff', '--name-only', `${streamBase(c, s)}..${head}`])).filter((f) => !matchesAny(f, c.cfg.docs_paths));
   const outside = files.filter((f) => !matchesAny(f, owned));
   const sum = (t) => lines(t).reduce((a, l) => { const [x, y] = l.split(/\s+/); return a + (Number(x) || 0) + (Number(y) || 0); }, 0);
-  const all = sum(git(c.repo, ['diff', '--numstat', `${c.st.base}..${head}`]));
-  const real = sum(git(c.repo, ['diff', '-w', '--ignore-cr-at-eol', '--numstat', `${c.st.base}..${head}`]));
+  const all = sum(git(c.repo, ['diff', '--numstat', `${streamBase(c, s)}..${head}`]));
+  const real = sum(git(c.repo, ['diff', '-w', '--ignore-cr-at-eol', '--numstat', `${streamBase(c, s)}..${head}`]));
   return { outside, line_endings: all > 20 && all > 5 * Math.max(real, 1), changed_lines: all, changed_ignoring_whitespace: real };
 }
 
@@ -1466,14 +1679,29 @@ function cmdOwner(o) {
       if (!o.why) fail('--why is required');
       record(c, 'owner.merge_without', { unit: arg, why: o.why }, o.lease); return { unit: arg, merge_without: true };
     }
-    default: fail('owner confirm|answer|waive|switch-on|ci-compose|merge-without|budget');
+    case 'ack-delegated': {
+      // The command names how many it acknowledges, so the prompt (or the terminal) shows the owner what he
+      // approves; status lists each one.
+      const open = unackedDelegated(c);
+      if (!open.length) fail('no delegated decision waits for the owner\'s acknowledgement');
+      if (String(o.count) !== String(open.length)) fail(`owner ack-delegated --count ${open.length}: the command names how many delegated decisions it acknowledges (${open.length} now; status lists them)${o.count !== undefined ? `, not ${o.count}` : ''}. Nothing recorded`);
+      const upto = Math.max(...open.map((x) => x.n));
+      record(c, 'owner.ack_delegated', { upto, count: open.length }, o.lease);
+      return { acknowledged: open.map((x) => `${x.stream}: ${x.text}`) };
+    }
+    default: fail('owner confirm|answer|waive|switch-on|ci-compose|merge-without|budget|ack-delegated');
   }
 }
 
 // ---------- release
 
+// Decisions the conductor settled under a delegated class that the owner has not yet acknowledged.
+const unackedDelegated = (c) => c.st.order.flatMap((n) => c.st.streams[n].delegated.filter((x) => x.n > c.st.ackedUpTo).map((x) => ({ stream: n, ...x })));
+
 function releaseView(c) {
   const problems = [];
+  const unacked = unackedDelegated(c);
+  if (unacked.length) problems.push(`${unacked.length} decision(s) settled under a delegated class are not acknowledged by the owner (status lists them): owner ack-delegated --count ${unacked.length}`);
   const tip = integrationHead(c);
   const head = codeHead(c, tip);
   const loose = unaccounted(c, tip);
@@ -1487,6 +1715,7 @@ function releaseView(c) {
     const s = c.st.streams[name];
     if (!s.merged) { notIn.push(name); continue; }
     if (s.needs.length) problems.push(`${name}: waits for the owner: ${s.needs.join('; ')}`);
+    if (cutProblem(c, s)) problems.push(cutProblem(c, s));
     const rt = redTeamState(c, s);
     const waivedRt = s.waived.some((w) => w.what === 'red-team');
     if (s.ship === 'on') {
@@ -1559,21 +1788,23 @@ function cmdStatus(o) {
     if (s.ship === 'research') cleared = 'owner question';
     else if (s.merged) cleared = (!needsRedTeam(s) || rt?.cleared) && !openOwed(s).length ? (s.ship === 'on' ? 'deploy' : (s.switchedOn ? 'switched on' : 'switch-on')) : 'not yet';
     const rtCell = rtLast ? `${rtLast.verdict} ${rtLast.model}${rt && rt.state === 'fixing' ? ' fixing' : rt && rt.state === 'stale' ? ' stale: due again' : ''}` : (rt ? 'due' : '');
-    return `| ${n} | ${s.tier}/${s.ship}${s.confirmed ? '' : ' (unconfirmed)'} | ${s.brief ? s.brief.premise : 'no'}${s.needs.length ? ' NEEDS OWNER' : ''} | ${s.rounds}${s.failed ? ` (${s.failed} failed)` : ''}${attempts.length ? ` [attempts: ${attempts.join(', ')}]` : ''}${open.length ? ' +' + open.join(',') + ' running' : ''} | ${lastRv ? lastRv.verdict : ''} | ${cell(tests)} | ${s.merged ? short(s.merged.commit).slice(0, 7) + (s.merged.conflicts.length ? ' (conflict)' : '') : ''} | ${cell(rtCell)} | ${cell(owed)} | ${cleared} |`;
+    return `| ${n} | ${s.tier}/${s.ship}${s.confirmed ? '' : ' (unconfirmed)'} | ${s.brief ? s.brief.premise : (waitingOn(c, s).length ? `waits for ${waitingOn(c, s).join(', ')}` : 'no')}${s.needs.length ? ' NEEDS OWNER' : ''}${s.delegated.length ? ` (${s.delegated.length} delegated)` : ''} | ${s.rounds}${s.failed ? ` (${s.failed} failed)` : ''}${attempts.length ? ` [attempts: ${attempts.join(', ')}]` : ''}${open.length ? ' +' + open.join(',') + ' running' : ''} | ${lastRv ? lastRv.verdict : ''} | ${cell(tests)} | ${s.merged ? short(s.merged.commit).slice(0, 7) + (s.merged.conflicts.length ? ' (conflict)' : '') : ''} | ${cell(rtCell)} | ${cell(owed)} | ${cleared} |`;
   });
   const ih = revParse(c.repo, st.integration);
   const icode = ih ? codeHead(c, ih) : null;
   const it = icode ? (st.itests[icode] || {}) : {};
   const table = ['| stream | tier/ship | brief | rounds | review | tests @head | merged | red team | owed | cleared for |', '|---|---|---|---|---|---|---|---|---|---|', ...rows].join('\n');
   const waits = st.order.flatMap((n) => st.streams[n].needs.map((x) => `${n}: ${x}`));
+  const unacked = unackedDelegated(c);
   const B = st.budgets;
   const units = Object.entries(st.deploys).map(([u, r]) => `${u} ${r.result}${r.rolled_back ? ' (rolled back)' : ''}`);
   const text = `${table}\n\nIntegration ${st.integration}${icode ? ' @' + short(icode) : ' (not created)'}: ${st.merges.length} merged; combined tests ${Object.keys(it).length ? Object.entries(it).map(([k, v]) => `${k}:${v.res}`).join(' ') : 'none at this head'}.\n`
     + `Waiting on the owner: ${waits.length ? waits.join('; ') : 'nothing'}.\n`
+    + (st.delegate.length ? `Delegated to the conductor in this run: ${st.delegate.join(', ')}. ${unacked.length ? `Settled under them, not yet acknowledged by the owner (release waits for owner ack-delegated --count ${unacked.length}): ${unacked.map((x) => `[${x.stream}] ${x.text}`).join('; ')}` : 'Nothing settled under them waits for the owner\'s acknowledgement'}.\n` : '')
     + (units.length ? `Deploy units: ${units.join('; ')}.\n` : '')
     + `Budgets used: workers ${st.counts.worker}/${B.max_worker_runs ?? '-'}, CI ${st.counts.ci}/${B.max_ci_runs ?? '-'}, red teams ${st.counts.red_team}/${B.max_red_team_passes ?? '-'}.\n`
     + `Run ${st.run}, lease ${st.lease}, last write ${st.lastWrite ? nowFmt(st.lastWrite, c.cfg.time_zone) : '-'}.`;
-  if (o.json) return { run: st.run, streams: st.order.map((n) => ({ ...st.streams[n], authors: [...st.streams[n].authors], reviewers: [...st.streams[n].reviewers] })), text };
+  if (o.json) return { run: st.run, delegate: st.delegate, unacknowledged_delegated: unacked, streams: st.order.map((n) => ({ ...st.streams[n], authors: [...st.streams[n].authors], reviewers: [...st.streams[n].reviewers] })), text };
   return text;
 }
 function nowFmt(iso, tz) { try { return new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'UTC', dateStyle: 'short', timeStyle: 'short', hourCycle: 'h23' }).format(new Date(iso)) + ' ' + (tz || 'UTC'); } catch { return iso; } }
@@ -1625,6 +1856,105 @@ function cmdVerify() {
   const res = { ok: problems.length === 0, problems, note: 'The chain shows a hand edit or a lost line. It is not a signature: anything that can run this helper can rewrite it.' };
   if (!res.ok) throw new NotYet(res);
   return res;
+}
+
+// ---------- teardown: put the project back as it was before the factory
+
+// What teardown would remove. Read-only; the same view is shown before the owner's yes and computed again
+// under the lock, and a list that changed in between is refused.
+function teardownView(o) {
+  const { file, repo, cfg: diskCfg } = load({ needTrust: false });
+  // The accepted guard snapshot, not the config on disk, says what main is and where the rules file is: an
+  // edit of the config after it was accepted cannot point teardown at something else.
+  let snap = null;
+  try { snap = JSON.parse(fs.readFileSync(guardFile(repo), 'utf8')); } catch { /* none: not accepted here */ }
+  const mainBranch = snap?.main_branch || diskCfg.main_branch;
+  const run = openRun(repo);
+  const st = run ? fold(readJsonl(runLog(repo, run))) : null;
+  const wts = [];
+  let cur = null;
+  for (const l of git(repo, ['worktree', 'list', '--porcelain']).split(/\r?\n/)) {
+    if (l.startsWith('worktree ')) { cur = { dir: path.resolve(l.slice(9)), branch: null }; wts.push(cur); }
+    if (l.startsWith('branch refs/heads/') && cur) cur.branch = l.slice(18);
+  }
+  // Only what the open run recorded: its integration branch, its streams' branches, and the worktrees its
+  // dispatches named (with the branch each has checked out). Nothing else under the worktree folder.
+  const names = new Set();
+  const dirs = [];
+  if (st) {
+    if (st.integration) names.add(st.integration);
+    for (const s of Object.values(st.streams)) if (s.branch) names.add(s.branch);
+    // Only worktrees the run built in (workers and brief writers): a research dispatch may name any worktree.
+    for (const d of Object.values(st.dispatches)) if (d.dir && (WORKER_ROLES.has(d.role) || d.role === 'brief_writer')) dirs.push(d.dir);
+    for (const w of wts) if (w.branch && dirs.some((x) => samePath(x, w.dir))) names.add(w.branch);
+  }
+  names.delete(mainBranch);
+  const worktrees = wts.filter((w) => !samePath(w.dir, repo) && w.branch !== mainBranch && ((w.branch && names.has(w.branch)) || dirs.some((x) => samePath(x, w.dir))))
+    .map((w) => ({ dir: w.dir, branch: w.branch, uncommitted: !!git(w.dir, ['status', '--porcelain'], { ok: true }) }));
+  const branches = [...names].map((b) => ({ branch: b, tip: revParse(repo, b) })).filter((b) => b.tip);
+  // Workers still running in those worktrees: teardown waits for them to be stopped.
+  const running = st ? Object.values(st.dispatches).filter((d) => !d.result && d.run_id).filter((d) => { const b = bridgeRecord(d.run_id); return b && (b.status === 'running' || b.status === 'starting'); }).map((d) => d.run_id) : [];
+  const tracked = (f) => git(repo, ['ls-files', '--error-unmatch', path.relative(repo, f)], { ok: true }) !== null;
+  const rulesFile = snap?.rules_file || rulesAbs(repo, diskCfg);
+  const files = o.files ? [file, rulesFile].filter((f) => under(f, repo) && fs.existsSync(f)).map((f) => ({ file: f, committed: tracked(f) })) : [];
+  const cfg = { ...diskCfg, main_branch: mainBranch };
+  const records = [trustFile(repo), guardFile(repo)].filter((f) => fs.existsSync(f));
+  // The commit that put the config on main, if the set-up committed it: main is never moved here.
+  let mainReset = null;
+  const added = git(repo, ['log', '--diff-filter=A', '--format=%H', '-1', cfg.main_branch, '--', CONFIG_NAME], { ok: true });
+  if (added) {
+    const since = lines(git(repo, ['rev-list', `${added}^..${cfg.main_branch}`], { ok: true }) || '').length;
+    const pushed = lines(git(repo, ['branch', '-r', '--contains', added], { ok: true }) || '').length > 0;
+    const subject = git(repo, ['log', '-1', '--format=%s', added], { ok: true }) || '';
+    mainReset = { commit: added, subject, commits_from_it_to_main: since, pushed,
+      command: pushed ? null : `git -C "${repo}" reset --keep ${short(added)}^`,
+      note: pushed ? `${short(added)} ("${subject}") put the config on ${cfg.main_branch} and is already on a remote branch: do not reset a pushed branch; revert it instead if you want it gone` : `${short(added)} ("${subject}") put the config on ${cfg.main_branch}. If it and the ${since - 1} commit(s) after it are only the factory's set-up and were never pushed, you can run the command yourself. It moves main, so it is yours to run.` };
+  }
+  const view = { repo, run, worktrees, branches, records, run_log: run ? runDir(repo, run) : null, files, main: mainReset, running };
+  const key = sha(JSON.stringify({ run, worktrees, branches, records, files })).slice(0, 12);
+  const text = [
+    `teardown: removes what the change factory set up in this project (list sha ${key})`,
+    ...(running.length ? [`  WORKERS STILL RUNNING (stop them first; teardown --yes refuses until then): ${running.join(', ')}`] : []),
+    `  open run: ${run ? `${run} (closed; its log is archived, not deleted: ${runDir(repo, run)})` : 'none'}`,
+    `  worktrees removed: ${worktrees.length ? worktrees.map((w) => `${w.dir}${w.uncommitted ? ' (HAS UNCOMMITTED CHANGES: lost)' : ''}`).join('; ') : 'none'}`,
+    `  branches deleted: ${branches.length ? branches.map((b) => `${b.branch} at ${short(b.tip)}`).join('; ') : 'none'}`,
+    `  trust and guard records removed: ${records.length ? records.join('; ') : 'none'}`,
+    `  files removed: ${o.files ? (files.filter((f) => !f.committed).map((f) => f.file).join('; ') || 'none') + (files.some((f) => f.committed) ? `; committed, so left for the reset below: ${files.filter((f) => f.committed).map((f) => f.file).join('; ')}` : '') : 'none (add --files for the config and the worker rules file)'}`,
+    `  ${cfg.main_branch} is not moved.${mainReset ? ' ' + mainReset.note + (mainReset.command ? `: ${mainReset.command}` : '') : ''}`,
+  ].join('\n');
+  return { view, key, text };
+}
+
+function cmdTeardown(o) {
+  const t = teardownView(o);
+  if (!o.yes) return { ...t.view, shown_to_owner: t.text, list_sha: t.key, next: 'show the owner every line of shown_to_owner; the owner removes it all with teardown --yes' + (o.files ? ' --files' : '') + (ownerModeHere() === 'deny' ? ' (an owner record, in his own terminal)' : ` --list-sha ${t.key} (an owner record)`) };
+  needOwner();
+  if (!SHOWN || SHOWN.teardown !== t.key) fail('what teardown would remove changed after it was shown to the owner: nothing removed. Show it again (teardown) and run teardown --yes again.');
+  const { view } = t;
+  if (view.running.length) fail(`workers are still running: ${view.running.join(', ')}. Stop them (opencode_stop), record their results, then run teardown again`);
+  if (view.worktrees.some((w) => under(process.cwd(), w.dir))) fail('teardown runs from the main checkout, not from a worktree it removes');
+  const done = { worktrees: [], branches: [], records: [], files: [], failed: [] };
+  for (const w of view.worktrees) {
+    if (git(view.repo, ['worktree', 'remove', '--force', w.dir], { ok: true }) !== null) done.worktrees.push(w.dir);
+    else done.failed.push(`worktree ${w.dir}: git worktree remove failed`);
+  }
+  git(view.repo, ['worktree', 'prune'], { ok: true });
+  for (const b of view.branches) {
+    if (git(view.repo, ['branch', '-D', b.branch], { ok: true }) !== null) done.branches.push(`${b.branch} (was ${b.tip}; to restore: git branch ${b.branch} ${b.tip})`);
+    else done.failed.push(`branch ${b.branch}: git branch -D failed`);
+  }
+  if (view.run) {
+    appendTo(runLog(view.repo, view.run), 'run.close', { run: view.run, teardown: true }, 'owner');
+    appendTo(projectLog(view.repo), 'run.close', { run: view.run, teardown: true }, 'owner');
+    const dest = path.join(projectDir(view.repo), 'archive', `${view.run}-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.renameSync(view.run_log, dest);
+    done.run_log_archived = dest;
+  }
+  for (const f of view.records) { fs.rmSync(f, { force: true }); done.records.push(f); }
+  for (const f of view.files) if (!f.committed) { fs.rmSync(f.file, { force: true }); done.files.push(f.file); }
+  return { ...done, main: view.main, run_closed: view.run || null,
+    note: 'The guard snapshot is gone, so the hook no longer guards this project, even before a new chat. Turning the plugin off (/plugin) takes effect only in a new chat.' };
 }
 
 // ---------- doctor
@@ -1680,21 +2010,33 @@ function loadSnapshots() {
 }
 
 // The shell segments of a command (split at &&, ||, ;, | and line breaks; quotes are not parsed, so
-// a separator inside a quoted text splits there too).
-const segmentsOf = (raw) => String(raw || '').split(/&&|\|\||;|\||\r?\n/).map((x) => norm(x)).filter(Boolean);
+// a separator inside a quoted text splits there too). With amp, also at a single & (a background
+// command); git calls are judged under both splits, since an & in a quoted value ("R&D") is not one.
+const segmentsOf = (raw, amp = false) => String(raw || '').split(amp ? /&&|\|\||;|\||&|\r?\n/ : /&&|\|\||;|\||\r?\n/).map((x) => norm(x)).filter(Boolean);
 
 // The shell segments that call the helper, as the helper will see its arguments.
 const cfSegments = (cmd) => segmentsOf(cmd)
   .map((seg) => { const m = seg.match(/cf\.mjs["'`]?\s+(.*)$/s); return m ? m[1] : null; }).filter((x) => x !== null);
 
-// git, git.exe or a quoted "git", then global options (-C <dir>, -c <k=v>, --flags), then the verb.
-const GIT_HEAD = String.raw`\bgit(?:\.exe)?["']?(?:\s+-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+)|\s+--?[\w-]+(?:=\S+)?)*\s+`;
+// git, git.exe or a quoted "git", then global options (-C <dir>, -c <k=v>, --flags), then the verb. An
+// option's value may hold quoted parts (-c user.name="A B"): a value that stopped at its space would hide
+// the verb, and the command would not be seen at all.
+const OPT_VAL = String.raw`(?:[^\s"']|"[^"]*"|'[^']*')+`;
+const GIT_OPTS = String.raw`(?:\s+-[Cc]\s+${OPT_VAL}|\s+--?[\w-]+(?:=${OPT_VAL})?)*`;
+const GIT_HEAD = String.raw`\bgit(?:\.exe)?["']?${GIT_OPTS}\s+`;
 const PUSH_RE = new RegExp(GIT_HEAD + String.raw`push\b`);
-const MOVE_RE = new RegExp(GIT_HEAD + String.raw`(?:merge|pull|reset|rebase|cherry-pick|revert|commit|am)\b`);
-const FETCH_RE = new RegExp(GIT_HEAD + String.raw`(?:fetch|pull)\b`);
+const MOVES = new Set(['merge', 'pull', 'reset', 'rebase', 'cherry-pick', 'revert', 'commit', 'am']);
+const FETCHES = new Set(['fetch', 'pull']);
+// Every git call in a text, with its global options and its verb.
+const GIT_CALL_RE = new RegExp(String.raw`\bgit(?:\.exe)?["']?(${GIT_OPTS})\s+([\w-]+)`, 'g');
 const unquote = (m) => m[2] ?? m[3] ?? m[4];
 const CD_RE = /^(?:cd|chdir|pushd|Set-Location|sl)\s+(?:-(?:Literal)?Path\s+)?("([^"]*)"|'([^']*)'|(\S+))$/i;
-const GIT_C_RE = /\bgit(?:\.exe)?["']?\s+-C\s+("([^"]*)"|'([^']*)'|(\S+))/;
+// One global option of a git call: -C <dir>, -c <k=v>, or --flag[=value]. Read in order, so a "-C" inside a
+// quoted -c value is part of that value, not an option.
+const OPT_RE = new RegExp(String.raw`\s+(-[Cc])\s+(${OPT_VAL})|\s+--?[\w-]+(?:=${OPT_VAL})?`, 'g');
+const dequote = (v) => v.replace(/"([^"]*)"|'([^']*)'/g, (_, a, b) => a ?? b);
+// The folder a git call acts on: each -C applies in turn, from the folder it starts in (git -C a -C b is a/b).
+const gitFolder = (opts, from) => [...opts.matchAll(OPT_RE)].filter((m) => m[1] === '-C').reduce((at, m) => path.resolve(at, dequote(m[2])), from);
 
 // What git says about a folder: the repository it belongs to (the folder holding its .git), its top
 // folder and the branch checked out there. null when git cannot tell.
@@ -1704,18 +2046,26 @@ const folderFacts = (dir) => {
   return { repo: path.dirname(path.resolve(common)), top: git(dir, ['rev-parse', '--show-toplevel'], { ok: true }), branch: git(dir, ['symbolic-ref', '--short', '-q', 'HEAD'], { ok: true }) };
 };
 
-// The git segments of a command that can move a branch, each with the folder it acts on: its -C
-// target, else the folder of the last cd before it, else the chat's folder.
+// The git calls of a command that can move a branch, each with the folder it acts on: its own -C
+// targets (wherever they stand among git's options), else the folder of the last cd before it in the
+// command, else the chat's folder. Quotes are not parsed: the command is split as segmentsOf does, and
+// every git call found in a segment is judged on its own -C, also one inside a quoted text (a commit
+// message naming "git reset" in the main checkout asks: a refusal too many, never one too few).
 function gitMoves(raw, cwd) {
   const out = [];
-  let dir = cwd || process.cwd();
-  for (const seg of segmentsOf(raw)) {
-    const cd = seg.match(CD_RE);
-    if (cd) { dir = path.resolve(dir, unquote(cd)); continue; }
-    const moves = MOVE_RE.test(seg), fetches = FETCH_RE.test(seg);
-    if (!moves && !fetches) continue;
-    const cflag = seg.match(GIT_C_RE);
-    out.push({ seg, at: cflag ? path.resolve(dir, unquote(cflag)) : dir, moves, fetches });
+  // Both splits, every call found by either: splitting at a single & finds a commit run in the background
+  // (git -C <wt> status & git commit), not splitting there keeps a quoted "Tom & Jerry" or R&D path whole.
+  for (const amp of [false, true]) {
+    let dir = cwd || process.cwd();
+    for (const seg of segmentsOf(raw, amp)) {
+      const cd = seg.match(CD_RE);
+      if (cd) { dir = path.resolve(dir, unquote(cd)); continue; }
+      for (const m of seg.matchAll(GIT_CALL_RE)) {
+        const moves = MOVES.has(m[2]), fetches = FETCHES.has(m[2]);
+        if (!moves && !fetches) continue;
+        out.push({ seg: seg.slice(m.index), at: gitFolder(m[1], dir), moves, fetches });
+      }
+    }
   }
   return out;
 }
@@ -1835,23 +2185,23 @@ function cmdSessionStart() {
 
 const SPEC = {
   init: [[], []], trust: [[], ['yes']], doctor: [[], []], capacity: [['free-gb'], []], role: [[], []], budget: [[], []],
-  run: [['integration', 'session', 'base', 'lease'], []], lease: [['session'], ['force']],
-  stream: [['title', 'tier', 'ship', 'lease'], []], brief: [['file', 'lease'], []],
+  run: [['integration', 'session', 'base', 'lease', 'delegate', 'plan', 'plan-sha'], []], lease: [['session'], ['force']],
+  stream: [['title', 'tier', 'ship', 'lease'], [], ['after']], brief: [['file', 'lease'], []],
   dispatch: [['role', 'model', 'target', 'on', 'expect', 'dir', 'prompt-file', 'lease'], []],
   result: [['outcome', 'head', 'file', 'model-ran', 'lease'], []],
   test: [['lease', 'state', 'stall-min'], []],
   merge: [['commit', 'lease'], []], lane: [['lease'], []], commit: [['kind', 'commit', 'stream', 'lease'], []], regenerate: [['lease'], []],
   canary: [['lease'], []], deploy: [['result', 'verified', 'lease'], ['rolled-back']], carry: [['kind', 'text', 'why', 'lease'], []],
-  owner: [['text', 'what', 'why', 'head', 'tier', 'ship', 'lease'], [], ['from']],
+  owner: [['text', 'what', 'why', 'head', 'tier', 'ship', 'count', 'lease'], [], ['from']],
   status: [[], ['json']], 'release-check': [[], []], 'finish-check': [[], []], reconcile: [[], []], strays: [[], []], verify: [[], []],
-  hook: [[], []], 'session-start': [[], []],
+  hook: [[], []], 'session-start': [[], []], teardown: [['list-sha'], ['yes', 'files']],
 };
 const CMDS = {
   init: cmdInit, trust: cmdTrust, doctor: cmdDoctor, capacity: cmdCapacity, role: cmdRole, budget: cmdBudget,
   run: cmdRun, lease: cmdLease, stream: cmdStream, brief: cmdBrief, dispatch: cmdDispatch, result: cmdResult, test: cmdTest,
   merge: cmdMerge, lane: cmdLane, commit: cmdCommit, regenerate: cmdRegenerate, canary: cmdCanary, deploy: cmdDeploy,
   carry: cmdCarry, owner: cmdOwner, status: cmdStatus, 'release-check': cmdReleaseCheck, 'finish-check': cmdFinishCheck,
-  reconcile: cmdReconcile, strays: cmdStrays, verify: cmdVerify, hook: cmdHook, 'session-start': cmdSessionStart,
+  reconcile: cmdReconcile, teardown: cmdTeardown, strays: cmdStrays, verify: cmdVerify, hook: cmdHook, 'session-start': cmdSessionStart,
 };
 
 const [name, ...rest] = process.argv.slice(2);
@@ -1863,7 +2213,7 @@ else {
     const [opts, flags, multi = []] = SPEC[name];
     const o = name === 'role' || name === 'budget' ? { _: rest } : parseOpts(rest, opts, flags, multi);
     // The owner's yes is taken before the lock: a terminal prompt may wait on a person.
-    if (isOwnerCommand(process.argv.slice(2).join(' '))) ownerProof();
+    if (isOwnerCommand(process.argv.slice(2).join(' '))) ownerProof(() => previewFor(name, o));
     // Every command that reads or writes a run holds the project's lock from its first read to its
     // last write. Not the hooks, not a test wait (it blocks for the whole test), not regenerate
     // (it takes the lock itself around its reads and its record).

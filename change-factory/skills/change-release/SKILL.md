@@ -12,7 +12,10 @@ the owner says yes or no. Run the helper as the entry skill `change-factory` say
 
 `release-check`. Exit 1 lists what stops it: commits not accounted for, unreviewed fixes, regenerate not clean
 at the head, combined suites without a pass, a stream that waits for the owner, a stream that ships ON without
-a cleared red team or with an owed pass. Fix those through `change-run`. An owed pass is either paid (a pass on
+a cleared red team or with an owed pass, and decisions settled under a delegated class that the owner has not
+acknowledged. For those, show the owner the list `status` prints, then the owner records
+`owner ack-delegated --count <n>` (an owner record; `n` is how many are open, so the record names what it
+acknowledges). If the owner disagrees with one, that is a fix through `change-run`, not an acknowledgement. Fix those through `change-run`. An owed pass is either paid (a pass on
 the wanted model) or waived by the owner (`owner waive <s> --what owed --why "<reason>"`, an owner record:
 with `hook_mode` deny, the default, they run it in their own terminal; with `ask` set, the hook asks them).
 

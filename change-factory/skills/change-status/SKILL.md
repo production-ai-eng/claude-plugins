@@ -20,8 +20,9 @@ and do not add rows the helper did not print. Then, in at most three lines of yo
 `carry list` shows what is carried from earlier runs; `verify` checks the log's chain (a hand edit or a lost
 line; it is not a signature).
 
-Columns: **tier/ship** low or high / on, off or research; **brief** the premise status, and NEEDS OWNER when the
-stream waits; **rounds** reviewed rounds, failed ones, attempts that were not rounds, and what is running;
+Columns: **tier/ship** low or high / on, off or research; **brief** the premise status, NEEDS OWNER when the
+stream waits for the owner, "waits for <s>" when it waits for another stream's merge, and "(n delegated)" for
+decisions settled under a delegated class (listed below the table until the owner acknowledges them); **rounds** reviewed rounds, failed ones, attempts that were not rounds, and what is running;
 **review** the last round review's verdict; **tests @head** suites at the stream's last round; **merged** the
 merge commit, with (conflict) if git found one; **red team** the verdict and model, "fixing" after CHANGES
 NEEDED, "stale: due again" after a later merge touched its files, "due" when none yet; **owed** passes run on a

@@ -851,6 +851,175 @@ ok('B-L2 a gate on a log whose chain is broken is refused', r.code === 2 && /ver
 l2[3] = keep2; fs.writeFileSync(log2, l2.join('\n'));
 ok('(set-up) the log is whole again', sh(['verify']).code === 0);
 
+// ---------- 0.2.0 #46: the guard judges each git call by its own -C, wherever it stands, and ignores separators in quotes
+const wtT1 = path.join(WT, 't1');
+ok('#46 cd <main> && git -C <stream worktree> commit gets no decision', dec(`cd "${repo}" && node cf.mjs result d1 --lease C && cp a "${wtT1}/b" && git -C "${wtT1}" add b && git -C "${wtT1}" commit -m x`, repo) === 'none');
+ok('#46 git -c user.name=... -C <stream worktree> commit, after a cd to main, gets no decision', dec(`cd "${repo}" && git -c user.name=opus -c user.email=o@x -C "${wtT1}" commit -m x`, repo) === 'none');
+ok('#46 git --no-pager -C <stream worktree> commit gets no decision', dec(`cd "${repo}" && git --no-pager -C "${wtT1}" commit -m x`, repo) === 'none');
+ok('#46 quotes are not parsed: a commit message holding "; git commit" still asks in main (a refusal too many, never one too few)', dec(`cd "${repo}" && git -C "${wtT1}" commit -m "brief t1; git commit on the stream"`, repo) === 'ask');
+ok('#46 red team A: an apostrophe in a comment does not hide a cd to main', dec(`# don't touch this\ncd "${repo}" && git commit -m x\n# that's all`, wtT1) === 'ask');
+ok('#46 red team B: a commit on the next line, after a comment with an apostrophe, is judged in main', dec(`git -C "${wtT1}" status # don't\ngit commit -m x # that's it`, repo) === 'ask');
+ok('#46 red team N1: an & inside a quoted -c value does not hide a commit in main', dec('git -c "user.name=Tom & Jerry" commit -m x', repo) === 'ask');
+ok('#46 red team N1: cd <main> && a commit whose -c value holds an &, from a worktree, asks', dec(`cd "${repo}" && git -c "user.name=Tom & Jerry" commit -m x`, wtT1) === 'ask');
+ok('#46 red team C: a -C inside a quoted -c value is not read as the folder', dec(`git -c "user.name=t -C ${wtT1}" commit -m x`, repo) === 'ask');
+ok('#46 cd <worktree> && git -C <main> commit is still guarded', dec(`cd "${wtT1}" && git -C "${repo}" commit -m x`, wtT1) === 'ask');
+ok('#46 a quoted -c value no longer hides a commit in main', dec('git -c user.name="A B" commit -m x', repo) === 'ask');
+ok('#46 a quoted -c value no longer hides a push', dec('git -c user.name="A B" push origin main', wtT1) === 'ask');
+ok('#46 a single & starts a new segment: git -C <wt> status & git commit (in main) asks', dec(`git -C "${wtT1}" status & git commit -m x`, repo) === 'ask');
+ok('#46 a command substitution in a commit message runs in the shell\'s folder: it is judged there', dec(`git -C "${wtT1}" commit -m "$(git reset --hard)"`, repo) === 'ask');
+ok('#46 an unclosed quote falls back to the old split, which still guards main', dec(`git -C "${wtT1}" commit -m "x; git commit`, repo) === 'ask');
+
+// ---------- 0.2.0 #43: one owner yes for the run's setup (a plan); #42 delegation; #44 dependencies; #45 --dir
+r = sh(['run', 'close', ...LC]);
+ok('(set-up) run r2 closes', r.code === 0, r.out);
+write('plans/bad.json', JSON.stringify({ streams: [{ name: 'p1', tier: 'low', ship: 'on', after: ['nope'] }] }), T);
+r = sh(['run', 'plan', path.join(T, 'plans/bad.json')]);
+ok('#43 a plan whose stream waits for an unknown stream is refused before anything is asked', r.code === 2 && /nope/.test(r.out), r.out);
+write('plans/esc.json', JSON.stringify({ streams: [{ name: 'p1', title: 'ok\u001b[2A\u001b[2Kdelegated: none', tier: 'low', ship: 'on' }] }), T);
+r = sh(['run', 'plan', path.join(T, 'plans/esc.json')]);
+ok('#43 red team M3: a title holding a terminal escape is refused (it could redraw the plan the owner reads)', r.code === 2 && /control characters/.test(r.out), r.out);
+write('plans/other.json', JSON.stringify({ delegate: ['other'], streams: [{ name: 'p1', tier: 'low', ship: 'on' }] }), T);
+r = sh(['run', 'plan', path.join(T, 'plans/other.json')]);
+ok('#42 the class "other" is never delegated', r.code === 2 && /never delegated/.test(r.out), r.out);
+const planFile = path.join(T, 'plans/r3.json');
+write('plans/r3.json', JSON.stringify({ budgets: { max_worker_runs: 40 }, delegate: ['copy'], streams: [
+  { name: 'p1', title: 'first phase', tier: 'low', ship: 'on' },
+  { name: 'p2', title: 'second phase', tier: 'low', ship: 'on', after: ['p1'] },
+] }), T);
+r = sh(['run', 'plan', planFile]);
+const plan = J(r);
+ok('#43 run plan shows the budgets, the delegated classes and each stream, with a sha', r.code === 0 && /max_worker_runs 40/.test(plan?.shown_to_owner) && /copy/.test(plan?.shown_to_owner) && /p2  tier low, ship on, waits for p1/.test(plan?.shown_to_owner) && /^[0-9a-f]{12}$/.test(plan?.plan_sha), r.out);
+const openR3 = ['run', 'open', 'r3', '--integration', 'cf/int3', '--session', 'D', '--plan', planFile];
+r = viaHook(openR3);
+ok('#43 ask mode: a plan without --plan-sha is refused (the prompt shows only the command)', r.code === 2 && /--plan-sha/.test(r.out), r.out);
+r = viaHook([...openR3, '--plan-sha', '000000000000']);
+ok('#43 a --plan-sha that is not the plan\'s is refused', r.code === 2 && /changed/.test(r.out), r.out);
+r = sh([...openR3, '--plan-sha', plan.plan_sha]);
+ok('#43 a plan opened without the owner\'s prompt is refused', r.code === 2 && /prompt/.test(r.out), r.out);
+r = viaHook([...openR3, '--plan-sha', plan.plan_sha]);
+ok('#43 one owner record opens the run, adds and confirms every stream', r.code === 0 && JSON.stringify(J(r)?.streams) === '["p1","p2"]' && J(r)?.budgets?.max_worker_runs === 40, r.out);
+const LD = ['--lease', 'D'];
+r = sh(['status']);
+ok('#43 status shows every stream confirmed and the planned budget', r.code === 0 && !/unconfirmed/.test(r.out) && /workers 0\/40/.test(r.out) && /\| p2 \|[^\n]*waits for p1/.test(r.out), r.out);
+ok('#42 status names the delegated classes', /Delegated to the conductor in this run: copy/.test(r.out), r.out);
+ok('#43 the events are chained as single records would be', sh(['verify']).code === 0);
+
+// #42: a delegated decision does not park; an undelegated one does; classes are checked
+const briefP = (decisions, owned = '- src/p1.js') => brief('holds', { decisions, owned });
+write('briefs/p1.md', briefP('- reworded the empty-state line (changes what is built: yes; class: wording)'), T);
+r = sh(['brief', 'record', 'p1', '--file', path.join(T, 'briefs/p1.md'), ...LD]);
+ok('#42 a decision class that is not one of the known classes is refused', r.code === 2 && /class "wording"/.test(r.out), r.out);
+write('briefs/p1.md', briefP('- the list opens on the newest item (changes what is built: yes; class: in-spec)'), T);
+r = sh(['brief', 'record', 'p1', '--file', path.join(T, 'briefs/p1.md'), ...LD]);
+ok('#42 an in-spec decision must cite the spec as file:line', r.code === 2 && /file:line/.test(r.out), r.out);
+write('briefs/p1.md', briefP('- reworded the empty-state line to pass the copy rule (changes what is built: yes; class: copy)'), T);
+r = sh(['brief', 'record', 'p1', '--file', path.join(T, 'briefs/p1.md'), ...LD]);
+ok('#42 a decision of a delegated class does not park the stream, and is listed', r.code === 0 && J(r)?.needs_owner === false && /copy: reworded/.test(JSON.stringify(J(r)?.delegated)), r.out);
+sh(['stream', 'add', 'p3', '--title', 'third', '--tier', 'low', '--ship', 'on', ...LD]);
+viaHook(['owner', 'confirm', 'p3', '--tier', 'low', '--ship', 'on', ...LD]);
+write('briefs/p3.md', briefP('- the button opens the first tab by default (changes what is built: yes; class: defaults)', '- src/p3.js'), T);
+r = sh(['brief', 'record', 'p3', '--file', path.join(T, 'briefs/p3.md'), ...LD]);
+ok('#42 a decision of a class not delegated parks the stream', r.code === 0 && J(r)?.needs_owner === true, r.out);
+sh(['stream', 'add', 'p4', '--title', 'fourth', '--tier', 'low', '--ship', 'on', ...LD]);
+viaHook(['owner', 'confirm', 'p4', '--tier', 'low', '--ship', 'on', ...LD]);
+write('briefs/p4.md', briefP('- kept the class: copy wording of the old help page (changes what is built: yes; class: other)', '- src/p4.js'), T);
+r = sh(['brief', 'record', 'p4', '--file', path.join(T, 'briefs/p4.md'), ...LD]);
+ok('#42 red team: the class is read from the marker, not from the decision\'s words', r.code === 0 && J(r)?.needs_owner === true, r.out);
+r = sh(['status']);
+ok('#42 status lists the delegated decision for the owner', /\[p1\] reworded the empty-state line/.test(r.out) && /ack-delegated --count 1/.test(r.out), r.out);
+
+// #44: p2 waits for p1
+r = sh(['brief', 'record', 'p2', '--file', path.join(T, 'briefs/p1.md'), ...LD]);
+ok('#44 a waiting stream cannot be briefed', r.code === 2 && /waits for p1/.test(r.out), r.out);
+r = sh(['dispatch', 'p2', '--role', 'brief_writer', ...LD]);
+ok('#44 nothing is dispatched for a waiting stream', r.code === 2 && /waits for p1/.test(r.out), r.out);
+
+// p1 goes through: worker, review, tests, merge
+const baseR3 = git(repo, 'rev-parse', 'main');
+const wtP1 = path.join(WT, 'p1'); git(repo, 'branch', 'p1', baseR3); addWorktree(wtP1, 'p1');
+const wti3 = path.join(WT, 'int3'); git(repo, 'branch', 'cf/int3', baseR3); addWorktree(wti3, 'cf/int3');
+let dP = J(sh(['dispatch', 'p1', '--role', 'worker', '--dir', wtP1, '--prompt-file', PROMPT, ...LD]));
+ok('#42 the stream whose only decision was delegated dispatches a worker without an owner answer', !!dP?.run_id, JSON.stringify(dP));
+write('src/p1.js', 'export const p1 = 1;\n', wtP1); commit(wtP1, 'p1 round 1');
+waitRun(dP.run_id); sh(['result', dP.dispatch, ...LD]);
+let rvP = J(sh(['dispatch', 'p1', '--role', 'round_reviewer', ...LD]));
+write('reviews/p1.md', 'verdict: MERGEABLE\n', T); sh(['result', rvP.dispatch, '--outcome', 'done', '--file', path.join(T, 'reviews/p1.md'), ...LD]);
+let cP = J(sh(['dispatch', 'p1', '--role', 'ci', ...LD])); ci({ unit: 'pass', api: 'pass', golden: 'pass' }); runTests(cP.dispatch, LD);
+merge(wti3, 'p1');
+const mP1 = git(wti3, 'rev-parse', 'HEAD');
+r = sh(['merge', 'record', 'p1', '--commit', mP1, ...LD]);
+ok('(set-up) p1 merged', r.code === 0, r.out);
+
+// red team M1: a commit of the conductor's own cannot be hidden under a waiting stream's cut
+write('src/auth.js', 'export const open = true;\n', wti3); commit(wti3, 'conductor: unreviewed');
+const wtHide = path.join(WT, 'p2hide'); git(repo, 'branch', 'p2hide', 'cf/int3'); addWorktree(wtHide, 'p2hide');
+r = sh(['dispatch', 'p2', '--role', 'brief_writer', '--dir', wtHide, '--expect', 'docs/cf/p2/brief.md', ...LD]);
+ok('#44 red team M1: a cut with an unaccounted commit below it is refused', r.code === 2 && /not accounted/.test(r.out), r.out);
+git(repo, 'worktree', 'remove', '--force', wtHide); git(repo, 'branch', '-D', 'p2hide');
+git(wti3, 'reset', '-q', '--hard', mP1);
+
+// #45 and #44: p2's brief is written in its own worktree, cut from the integration head
+const wtP2bad = path.join(WT, 'p2bad'); git(repo, 'branch', 'p2bad', baseR3); addWorktree(wtP2bad, 'p2bad');
+r = sh(['dispatch', 'p2', '--role', 'brief_writer', '--dir', wtP2bad, '--expect', 'docs/cf/p2/brief.md', ...LD]);
+ok('#44 a waited-for stream\'s branch cut from the run\'s base (without p1\'s merge) is refused', r.code === 2 && /integration head/.test(r.out), r.out);
+const wtP2 = path.join(WT, 'p2'); git(repo, 'branch', 'p2', 'cf/int3'); addWorktree(wtP2, 'p2');
+r = sh(['dispatch', 'p2', '--role', 'brief_writer', '--dir', wtP2, '--expect', 'docs/cf/p2/brief.md', ...LD]);
+const dBw = J(r);
+ok('#45 a brief writer dispatched with --dir from the main checkout expects the file in that worktree', r.code === 0 && dBw?.expect && path.resolve(dBw.expect) === path.join(wtP2, 'docs', 'cf', 'p2', 'brief.md'), r.out);
+write('docs/cf/p2/brief.md', briefP('- none', '- src/p2.js'), wtP2);
+r = sh(['result', dBw.dispatch, '--outcome', 'done', '--file', 'docs/cf/p2/brief.md', ...LD]);
+ok('#45 result accepts the brief written there (a relative --file is read from the worktree)', r.code === 0, r.out);
+commit(wtP2, 'p2: brief');
+r = sh(['brief', 'record', 'p2', '--file', path.join(wtP2, 'docs/cf/p2/brief.md'), ...LD], { cwd: wtP2 });
+ok('#44 once p1 is merged, p2 is briefed (from its worktree)', r.code === 0 && J(r)?.needs_owner === false, r.out);
+r = sh(['dispatch', 'p2', '--role', 'worker', '--dir', wtP2bad, '--prompt-file', PROMPT, ...LD]);
+ok('#44 p2\'s first worker round is refused on a branch without p1\'s merge', r.code === 2 && /integration head/.test(r.out), r.out);
+dP = J(sh(['dispatch', 'p2', '--role', 'worker', '--dir', wtP2, '--prompt-file', PROMPT, ...LD]));
+ok('#44 p2\'s first worker round runs on the branch cut from the integration head', !!dP?.run_id, JSON.stringify(dP));
+write('src/p2.js', 'import { p1 } from "./p1.js";\nexport const p2 = p1 + 1;\n', wtP2); commit(wtP2, 'p2 round 1');
+waitRun(dP.run_id); sh(['result', dP.dispatch, ...LD]);
+r = sh(['lane', 'p2', ...LD]);
+ok('#44 p2\'s lane is read from its cut, so p1\'s files are not outside it', r.code === 0 && J(r)?.outside?.length === 0, r.out);
+rvP = J(sh(['dispatch', 'p2', '--role', 'round_reviewer', ...LD]));
+ok('#44 p2\'s review pack holds only p2\'s change, not p1\'s', !!rvP?.pack && !/src\/p1\.js/.test(fs.readFileSync(rvP.pack, 'utf8')) && /src\/p2\.js/.test(fs.readFileSync(rvP.pack, 'utf8')), rvP?.pack);
+
+// #42: release waits for the owner's acknowledgement
+r = sh(['release-check']);
+ok('#42 release-check refuses until the owner acknowledges the delegated decisions', r.code === 1 && /ack-delegated --count 1/.test(r.out), r.out);
+r = viaHook(['owner', 'ack-delegated', '--count', '2', ...LD]);
+ok('#42 owner ack-delegated must name how many it acknowledges', r.code === 2 && /--count 1/.test(r.out), r.out);
+r = sh(['owner', 'ack-delegated', '--count', '1', ...LD]);
+ok('#42 owner ack-delegated is an owner record', r.code === 2 && /prompt/.test(r.out), r.out);
+r = viaHook(['owner', 'ack-delegated', '--count', '1', ...LD]);
+ok('#42 the owner acknowledges them', r.code === 0 && /reworded/.test(r.out), r.out);
+r = sh(['release-check']);
+ok('#42 after the acknowledgement release-check no longer lists them', !/ack-delegated/.test(r.out), r.out);
+
+// ---------- 0.2.0 #47: teardown
+r = sh(['teardown']);
+const td = J(r);
+ok('#47 teardown without --yes only shows what it would remove', r.code === 0 && td?.run === 'r3' && td.worktrees.length > 0 && td.branches.some((b) => b.branch === 'p1') && /teardown --yes/.test(td.next) && fs.existsSync(wtP1), r.out);
+ok('#47 teardown takes only the run\'s own worktrees: one under the worktree folder that the run never used is not listed', !td.worktrees.some((w) => w.dir === wtP2bad) && !td.branches.some((b) => b.branch === 'p2bad'), JSON.stringify(td?.worktrees));
+r = sh(['teardown', '--yes', '--list-sha', td.list_sha]);
+ok('#47 teardown --yes is an owner record', r.code === 2 && /prompt/.test(r.out), r.out);
+r = viaHook(['teardown', '--yes']);
+ok('#47 red team M4: ask mode needs --list-sha (the prompt shows only the command)', r.code === 2 && /--list-sha/.test(r.out), r.out);
+write('late.txt', 'work that appeared after the list was shown\n', wtP1);
+r = viaHook(['teardown', '--yes', '--list-sha', td.list_sha]);
+ok('#47 red team M4: a list that changed after it was shown (new uncommitted work) is refused', r.code === 2 && /changed/.test(r.out) && fs.existsSync(wtP1), r.out);
+fs.rmSync(path.join(wtP1, 'late.txt'));
+r = viaHook(['teardown', '--yes', '--list-sha', td.list_sha]);
+const tdDone = J(r);
+ok('#47 teardown --yes removes the run\'s worktrees and branches, and archives the log', r.code === 0 && tdDone?.run_closed === 'r3' && fs.existsSync(tdDone.run_log_archived || T + '/none') && !fs.existsSync(wtP1), r.out);
+const wtList = git(repo, 'worktree', 'list').replace(/\\/g, '/');
+ok('#47 git worktree list shows none of the run\'s worktrees, and keeps one the run never used', [wtP1, wtP2, wti3].every((w) => !wtList.split('\n').some((l) => l.startsWith(w.replace(/\\/g, '/') + ' '))) && wtList.includes(wtP2bad.replace(/\\/g, '/')), wtList);
+ok('#47 git branch shows none of the run\'s branches', !/\b(p1|p2|cf\/int3)\b/.test(git(repo, 'branch')), git(repo, 'branch'));
+r = sh(['session-start'], { input: JSON.stringify({ cwd: repo, source: 'startup' }) });
+ok('#47 a new session shows no open-run note', r.code === 0 && !/is open/.test(r.out), r.out);
+r = sh(['doctor']);
+ok('#47 doctor reports the project as not set up (the config is no longer accepted here)', J(r)?.ok === false && /not accepted/.test(r.out), r.out);
+ok('#47 main is not moved; the guard snapshot is gone, so the hook no longer guards a commit there', git(repo, 'rev-parse', 'main') === baseR3 && dec('git commit -m x', repo) === 'none');
+
 for (const wt of fs.readdirSync(WT)) { try { git(repo, 'worktree', 'remove', '--force', path.join(WT, wt)); } catch {} }
 fs.rmSync(T, { recursive: true, force: true });
 fs.rmSync(elsewhere, { recursive: true, force: true });

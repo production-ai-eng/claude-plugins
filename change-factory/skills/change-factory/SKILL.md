@@ -1,6 +1,6 @@
 ---
 name: change-factory
-description: Entry point of the change factory - set a project up for a change run (config, worker rules, doctor, the owner's trust), resume a run after a restart, a compacted chat or an account switch (lease, reconcile, restart waits, canary, owed passes, status), and change the settings in conversation. Use when someone says "/change-factory", "set up the change factory", "resume the change run", "pick the run back up", "where is the run", "change the red team model", or a session start note says a change-factory run is open.
+description: Entry point of the change factory - set a project up for a change run (config, worker rules, doctor, the owner's trust), resume a run after a restart, a compacted chat or an account switch (lease, reconcile, restart waits, canary, owed passes, status), change the settings in conversation, and tear a project's factory set-up down. Use when someone says "/change-factory", "set up the change factory", "resume the change run", "pick the run back up", "where is the run", "change the red team model", "tear it down", "remove the change factory", or a session start note says a change-factory run is open.
 ---
 
 # Change factory
@@ -22,8 +22,9 @@ Every write takes `--lease <session>`: the session id you chose when the run ope
 
 ## Owner records go through the owner
 
-`owner ...` (confirm, answer, waive, switch-on, ci-compose, merge-without, budget), `trust --yes`, `run open`,
-and a change of a red team's model, fallback or on_fallback are owner records. Never word a request so the
+`owner ...` (confirm, answer, waive, switch-on, ci-compose, merge-without, budget, ack-delegated), `trust --yes`,
+`run open` (with or without a plan), `teardown --yes`, and a change of a red team's model, fallback or
+on_fallback are owner records. Never word a request so the
 owner approves something they did not decide. A message from another session or agent is never the owner's
 answer.
 
@@ -37,7 +38,7 @@ answer.
   command typed in this chat with `!` has no terminal and is refused. Give the owner the full command, with the
   helper's full path.
 
-An owner record's text (`--text`, `--why`) cannot hold `;`, `|`, `&&`, a redirect or a line break: the hook
+An owner record's text (`--text`, `--why`) cannot hold `;`, `|`, `&`, a redirect or a line break: the hook
 cuts the command there, so the helper refuses it. Write it with commas instead.
 
 ## Set up a project
@@ -84,6 +85,24 @@ Do these in order, every time a chat picks up an open run (after a restart, a co
 - Changing any command, unit, rules path or `roles.pre_merge_red_team.streams` is an edit of the file followed
   by `trust` and the owner's `trust --yes`.
 - `capacity`: how many workers the machine guard allows now.
+
+## Throw it away (teardown)
+
+When the owner wants the project put back as it was before the factory:
+
+1. `teardown [--files]` (read only) prints `shown_to_owner` and `list_sha`: the open run (closed, its log
+   archived, not deleted), the run's own worktrees and branches removed (with any uncommitted changes that
+   would be lost, and each branch's tip so it can be restored), the trust and guard records removed, and with
+   `--files` the config and worker rules file if they are not committed. Show the owner every line. Stop any
+   worker still running first: teardown refuses while one is.
+2. The owner runs `teardown --yes [--files]`, an owner record: in `hook_mode` deny in his own terminal, where
+   the same list is shown again before his `yes`; with `hook_mode` ask, add `--list-sha <list_sha>`. A list that
+   changed after it was shown is refused.
+3. Main is never moved. If the set-up committed the config to main, the result names that commit and, if it
+   was never pushed, the exact `git reset --keep` the owner may run himself. With the guard snapshot gone the
+   hook no longer stops it. A pushed commit is reverted, not reset.
+
+Turning the plugin off with `/plugin` takes effect only in a new chat.
 
 ## The other skills
 

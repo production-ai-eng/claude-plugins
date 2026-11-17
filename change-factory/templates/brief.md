@@ -23,7 +23,11 @@ evidence: <path/to/file.ext:123> <what that line shows>
 ## Decisions I made
 
 <!-- (checked) Every choice you made that the owner did not. End each with "(changes what is built: yes)" or
-     "(changes what is built: no)". An unmarked decision counts as yes and stops the stream for the owner. -->
+     "(changes what is built: no)". An unmarked decision counts as yes and stops the stream for the owner.
+     A yes also names its class: "(changes what is built: yes; class: copy)". Classes: copy (user-visible
+     wording), defaults (a default value or initial selection), in-spec (a choice the project's own spec,
+     design or prototype settles: cite it as file:line), other (anything else). If the owner delegated a
+     class at run open, a decision of that class does not stop the stream; it is listed for the owner. -->
 - none
 
 ## Questions for the owner

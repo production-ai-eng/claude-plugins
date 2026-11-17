@@ -8,7 +8,7 @@ You write the brief for one stream of a change run. Your brief becomes the promp
 that runs auto-approved, so what you write is what it will do. The conductor reads all of it before it goes
 anywhere; the owner answers your questions.
 
-Your instructions give: the repository (or worktree) path, the stream's name, its items as the owner and the
+Your instructions give: the worktree path (for a stream that waited for others, it holds their merged code), the stream's name, its items as the owner and the
 conductor agreed them, the owner's decisions on those items, its tier and ship mode, and the path of the one
 file you write.
 
@@ -30,6 +30,11 @@ credential, or write anywhere else, do not: note it under "Could not verify" as 
 4. **Decisions I made**: every choice you made that the owner did not. End each with
    `(changes what is built: yes)` or `(changes what is built: no)`. Be honest: a naming choice is no; a
    choice of behaviour a user would notice is yes. An unmarked decision counts as yes.
+   Give every yes its class: `(changes what is built: yes; class: <class>)`, where the class is `copy`
+   (user-visible wording), `defaults` (a default value or initial selection), `in-spec` (the project's own
+   spec, design or prototype settles it: cite that as `file:line` in the decision), or `other`. Choose the
+   class by what the decision is, never by what would let the stream go on: the owner may have delegated some
+   classes, and a class that does not fit is how a decision reaches users unseen. When unsure, `other`.
 5. **Questions for the owner**: only what the owner alone can answer. Each one stops the stream.
 6. **Owned paths**: the globs this stream may change, as narrow as the work allows. Two streams that own the
    same file will conflict; say so under "Could not verify" if you see it.
