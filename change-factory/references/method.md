@@ -46,7 +46,7 @@ subagent call, or that the agent wrote its own file: those are the conductor's h
 ## One stream, as states
 
 ```
-proposed -> confirmed (owner: tier + ship mode) -> briefed -> [needs owner] -> ready
+proposed -> confirmed (owner: tier + ship mode) -> [waits for another stream's merge] -> briefed -> [needs owner] -> ready
 ready -> round n: dispatched -> ended -> reviewed (MERGEABLE | CHANGES NEEDED) -> next round | tested
 tested (green at its code head) -> merged (merge commit M) -> [red team due] -> cleared | fixing
 fixing -> fix dispatch -> fix reviewed MERGEABLE -> combined test green -> cleared
@@ -56,9 +56,24 @@ cleared -> ships: deploy (on) | switch-on later (off) | owner question (research
 
 - **Tier** (low / high) and **ship mode** (on / off behind a flag / research) are set at intake and confirmed
   by the owner, because they decide whether a red team runs.
-- **Needs owner**: a changed premise, a brief decision marked as changing what is built (or not marked), or a
-  question for the owner. Dispatch is refused until the owner's answer is recorded. Recording the brief again
-  can add to what waits for the owner, never remove it: only the owner's answer clears it.
+- **Needs owner**: a changed premise, a brief decision marked as changing what is built (or not marked) and not
+  of a delegated class, or a question for the owner. Dispatch is refused until the owner's answer is recorded.
+  Recording the brief again can add to what waits for the owner, never remove it: only the owner's answer
+  clears it.
+- **Delegated decisions.** At `run open` the owner may delegate decision classes: `copy` (user-visible
+  wording), `defaults` (a default value or initial selection), `in-spec` (a choice the project's own spec,
+  design or prototype settles, cited as file:line). `other` is never delegated. A brief decision marked
+  `(changes what is built: yes; class: <class>)` of a delegated class does not stop its stream; it is
+  recorded, listed in `status`, and `release-check` and `finish-check` refuse until the owner acknowledges
+  every one with `owner ack-delegated --count <n>`. Deploys, pushes, moves of main, red-team model changes and
+  budget raises stay the owner's records. That a decision is in the class it says is the brief writer's and
+  the conductor's honesty: the helper checks only that the class is known and that `in-spec` cites a line.
+- **Waits for another stream** (`stream add --after <s>`, or `after` in a run plan): no brief and no dispatch
+  until `<s>`'s merge is recorded. Its branch must then start from an integration commit that holds that merge
+  (the helper checks this at its brief writer with `--dir` and at its first worker round), and its lane, review
+  packs and test gate are read from that commit, its **cut**, not from the run's base. The cut must be on the
+  integration branch's first-parent line with every commit below it accounted for, and stay there: a move of
+  the integration branch under it stops the stream's tests, merge and the release.
 - A **research** stream ends at a finding file and an owner question. It never becomes code in the same run.
   The finding is written by the research analyst (or the configured research runner); the owner's answer is
   recorded, and what follows from it is a carry item for a later run.
@@ -126,8 +141,29 @@ unit that carries code is recorded ok, or the owner records that main moves with
 
 ## Budgets
 
-A run takes its budgets from the config when it opens. The owner changes them inside an open run with
-`owner budget <key> <n> --why <reason>` (an owner record); an edit of the config applies from the next run.
+A run takes its budgets from the config when it opens (or from its plan: below). The owner changes them inside
+an open run with `owner budget <key> <n> --why <reason>` (an owner record); an edit of the config applies from
+the next run.
+
+## Opening a run with one yes
+
+A **run plan** (a JSON file: `budgets` that differ from the config, `delegate`, and `streams` with name, title,
+tier, ship mode and `after`) lets the owner open the run, set its budgets and delegated classes, and add and
+confirm every stream with one owner record: `run open ... --plan <file>`. The whole plan is checked before the
+owner is asked, and shown to him: at his terminal in `hook_mode` deny; in `hook_mode` ask the conductor shows
+`run plan <file>` and the command carries `--plan-sha`, so the yes is bound to that plan. A plan that changed
+after it was shown is refused. Each stream is still recorded as its own `stream.add` and `owner.confirm`
+event.
+
+## Teardown
+
+`teardown` shows, and `teardown --yes` (an owner record) removes, what the factory set up: the open run's own
+branches (integration and streams) and the worktrees its dispatches named, the trust record and guard snapshot,
+and with `--files` the config and rules file when they are not committed. In `hook_mode` ask the command
+carries the list's hash (`--list-sha`); a list that changed after it was shown, or a worker still running, is
+refused. The run is closed and its log archived, not
+deleted, so the session-start note stops. Main is never moved: the result names the commit that put the config
+on main and, if it was never pushed, the `git reset --keep` the owner may run.
 
 ## The records
 
@@ -145,8 +181,10 @@ anyone.
 ## What v1 is and is not
 
 In v1: one repository per run; OpenCode workers through the bundled bridge; subagent roles; local tests or a
-configured CI command; per-unit release; a carry register across runs; a status table in chat.
+configured CI command; per-unit release; a carry register across runs; a status table in chat; streams that
+wait for another's merge; delegated decision classes; a run plan; teardown.
 
 Not in v1: more than one repository per run (a change to two repositories is two runs); another worker
 bridge; a live status page; a signature on the event log; refusing compute on the owner's machine beyond the
-agents' tool lists; a check that a subagent ran on the model it was dispatched with.
+agents' tool lists; a check that a subagent ran on the model it was dispatched with; changing the delegated
+classes of a run that is already open.
